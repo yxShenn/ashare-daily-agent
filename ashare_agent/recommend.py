@@ -6,7 +6,7 @@ import json
 
 import pandas as pd
 
-from . import data, portfolio, store, universe
+from . import data, portfolio, serenity, store, universe
 from .factors import FACTOR_NAMES, compute_factor_frame
 from .strategy import score_cross_section
 
@@ -43,12 +43,19 @@ def run_recommend(cfg: dict, rec_date: str | None = None) -> dict | None:
     short = pool.sort_values("amount", ascending=False).head(n).reset_index(drop=True)
 
     mf_days = int(cfg["run"].get("mainflow_days", 5))
+    sr_cfg = cfg.get("serenity", {})
+    use_industry = bool(sr_cfg.get("use_industry", False))
+    serenity_hits: dict[str, str] = {}
     rows = []
     for _, r in short.iterrows():
         hist = data.get_hist(
             r["symbol"], cfg["hist"]["lookback_days"], cfg["hist"]["adjust"]
         )
-        ff = compute_factor_frame(hist, data.get_fund_flow(r["symbol"]), mf_days)
+        industry = data.get_base_info(r["symbol"]).get("industry") if use_industry else None
+        choke, theme = serenity.membership(r["symbol"], r.get("name"), industry, cfg)
+        if theme:
+            serenity_hits[r["symbol"]] = theme
+        ff = compute_factor_frame(hist, data.get_fund_flow(r["symbol"]), mf_days, choke)
         if ff.empty:
             continue
         last = ff.iloc[-1]
@@ -71,6 +78,7 @@ def run_recommend(cfg: dict, rec_date: str | None = None) -> dict | None:
     brow = fdf.loc[best]
     reason = {
         "score": round(float(scores.iloc[0]), 4),
+        "serenity": serenity_hits.get(best),   # 命中的卡脖子赛道标签(若有)
         "factors": {c: round(float(brow[c]), 4) for c in FACTOR_NAMES},
         "turnover": None if pd.isna(brow["turnover"]) else round(float(brow["turnover"]), 2),
         "amount_yi": round(float(binfo["amount"]), 2),

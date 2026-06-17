@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 FACTOR_NAMES = ["ma", "macd", "rsi", "kdj", "boll", "momentum", "volume",
-                "pullback", "mainflow"]
+                "pullback", "mainflow", "serenity"]
 
 
 def _ema(s: pd.Series, span: int) -> pd.Series:
@@ -27,12 +27,13 @@ def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
 
 
 def compute_factor_frame(df: pd.DataFrame, fund_flow: pd.DataFrame | None = None,
-                         mainflow_days: int = 5) -> pd.DataFrame:
+                         mainflow_days: int = 5, choke: float = 0.0) -> pd.DataFrame:
     """输入标准化K线(date/open/close/high/low/volume,升序),
     返回含 date + 各因子列的 DataFrame(数据不足处为 NaN)。
 
     fund_flow:个股资金流向(data.get_fund_flow),用于计算 mainflow 因子
-    (近 mainflow_days 日主力净流入占比均值);缺失时记 0(中性,不剔除该股)。"""
+    (近 mainflow_days 日主力净流入占比均值);缺失时记 0(中性,不剔除该股)。
+    choke:卡脖子赛道成员身份(0/1),作为 serenity 因子(时间不变,权重由优化器学习)。"""
     if df is None or df.empty or len(df) < 60:
         return pd.DataFrame(columns=["date"] + FACTOR_NAMES)
 
@@ -86,4 +87,7 @@ def compute_factor_frame(df: pd.DataFrame, fund_flow: pd.DataFrame | None = None
         out["mainflow"] = out["date"].map(roll).astype(float).fillna(0.0)
     else:
         out["mainflow"] = 0.0
+
+    # 卡脖子赛道成员身份(0/1,时间不变);权重由 walk-forward 优化器学习
+    out["serenity"] = float(choke)
     return out

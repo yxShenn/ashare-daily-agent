@@ -26,6 +26,11 @@ def build_report(cfg: dict, rec: dict | None, evals: list[dict],
         lines.append(f"- **选股参考价**:{rec['entry_close']} | 当日涨跌:{reason.get('pct')}%")
         if rec.get("limit_price") is not None:
             lines.append(f"- **目标买入价(限价)**:{rec['limit_price']} —— 现价回调到该价才成交")
+        sr = reason.get("serenity")
+        if sr:
+            w = cfg.get("factors", {}).get("serenity")
+            wtxt = f",优化器学到权重 {round(float(w),3)}" if w is not None else ""
+            lines.append(f"- **卡脖子赛道**:命中「{sr}」(serenity 因子=1{wtxt})")
         lines.append(f"- **综合评分**:{rec['score']}")
         lines.append(f"- **持有期**:{rec['holding_days']} 个交易日 | "
                      f"**目标**:最高涨幅 ≥ {rec['target']*100:.1f}% | "

@@ -203,3 +203,33 @@ def get_fund_flow(symbol: str) -> pd.DataFrame:
     df.to_pickle(path)
     _MEM[key] = df
     return df
+
+
+def get_base_info(symbol: str) -> dict:
+    """个股基础信息(efinance 源):返回 {industry: 所处行业, name}。失败返回 {}。
+
+    用于 Serenity 卡脖子赛道的板块层加权(按行业/名称匹配主题)。按日缓存。
+    """
+    key = f"base_{symbol}"
+    if key in _MEM:
+        return _MEM[key]
+    ensure_dirs()
+    path = CACHE_DIR / f"base_{symbol}.pkl"
+    if _is_fresh(path):
+        info = pd.read_pickle(path)
+        _MEM[key] = info
+        return info
+
+    try:
+        import efinance as ef
+        s = ef.stock.get_base_info(symbol)
+    except Exception:
+        s = None
+    if s is None:
+        _MEM[key] = {}
+        return _MEM[key]
+    d = s.to_dict() if hasattr(s, "to_dict") else dict(s)
+    info = {"industry": d.get("所处行业"), "name": d.get("股票名称")}
+    pd.to_pickle(info, path)
+    _MEM[key] = info
+    return info

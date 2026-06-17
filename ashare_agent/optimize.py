@@ -15,7 +15,7 @@ import datetime as _dt
 import numpy as np
 import pandas as pd
 
-from . import config, data, exits
+from . import config, data, exits, serenity
 from .factors import FACTOR_NAMES, compute_factor_frame
 
 _MIN_CROSS = 10        # 单日参与横截面的最少股票数
@@ -57,14 +57,16 @@ def _build_panels(cfg: dict) -> list[tuple]:
     hold = int(cfg["run"]["holding_days"])
     target = float(cfg["run"]["success_threshold"])
     trend_ma = int(cfg["exit"]["trend_ma"])
+    mf_days = int(cfg["run"].get("mainflow_days", 5))
+    name_lut = data.get_spot().set_index("symbol")["name"].to_dict()
     by_date: dict[np.datetime64, list] = {}
 
     for sym in _sample_symbols(cfg):
         hist = data.get_hist(sym, cfg["hist"]["lookback_days"], cfg["hist"]["adjust"])
         if hist.empty or len(hist) < 80:
             continue
-        ff = compute_factor_frame(hist, data.get_fund_flow(sym),
-                                  int(cfg["run"].get("mainflow_days", 5)))
+        choke, _ = serenity.membership(sym, name_lut.get(sym), None, cfg)
+        ff = compute_factor_frame(hist, data.get_fund_flow(sym), mf_days, choke)
         if ff.empty:
             continue
         fvals = ff[FACTOR_NAMES].values
