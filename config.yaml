@@ -1,0 +1,78 @@
+# A股每日选股 Agent · 默认配置
+# 说明:factors 下的权重会被优化器写出的 data/active_config.json 覆盖(若存在)。
+
+run:
+  holding_days: 5            # 信号评估窗口(交易日),仅用于"命中率"统计与优化的winrate目标
+  success_threshold: 0.10   # 信号命中判定:买入后 holding_days 内涨幅达到 10%
+  stop_loss: -0.05          # 硬止损线(本金保护,智能出场也以此为底线)
+  top_candidates: 80        # 预筛候选数(仅对这些股票计算技术因子,懒加载)
+  mainflow_days: 5          # 主力净流入因子:近 N 日主力净流入占比均值
+
+# 智能动态出场(替代机械的固定止盈/到期):让盈利奔跑,亏损与走坏快速离场
+exit:
+  trail_activate: 0.05      # 浮盈≥5% 后启动移动止盈
+  trail_pct: 0.05           # 自持仓最高点回撤5% 离场(锁定利润、让盈利奔跑)
+  trend_ma: 10              # 收盘跌破 MA10 视为趋势走坏 → 离场(仅收盘判定)
+  cut1_days: 2              # 持有≥2日 且
+  cut1_loss: -0.03          #   浮亏≥3% → 提前止损(亏损+时间级联,判断错了就砍)
+  cut2_days: 6              # 持有≥6日 且
+  cut2_flat: 0.01           #   涨幅<1%(死钱占用资金) → 换仓
+  max_hold: 30              # 最长持有(防僵尸仓)
+
+# 风险控制(本金保护)
+risk:
+  max_drawdown: 0.15        # 账户最大回撤上限;超过则暂停建仓。也是 profit 优化目标的约束
+
+universe:
+  min_amount: 0.5           # 最小成交额(亿元) —— 流动性过滤
+  exclude_st: true          # 剔除 ST/*ST/退市风险
+  limit_buffer: 9.5         # |当日涨跌幅| >= 该值视为难买入(一字板等),剔除
+
+# 可优化因子权重(由历史K线点位安全计算,参与 walk-forward 优化)
+factors:
+  ma: 1.0                   # 均线多头排列
+  macd: 1.0                 # MACD 动能
+  rsi: 0.5                  # RSI 健康区间
+  kdj: 0.5                  # KDJ 金叉/J值
+  boll: 0.5                 # 布林带位置
+  momentum: 1.0            # 中期动量
+  volume: 0.8              # 量能放大
+  pullback: 0.5            # 回踩不追高
+  mainflow: 1.0           # 主力资金净流入(近5日占比均值,大资金流向)
+
+optimize:
+  enabled: true
+  objective: profit         # 优化目标: winrate(命中率最大化) | profit(回撤约束下收益最大化)
+  window_days: 120          # walk-forward 回测窗口(交易日)
+  sample_size: 150          # 回测样本股票数(按当日成交额取最活跃者)
+  n_trials: 150             # 随机搜索次数
+  min_trades: 20            # 最少样本交易数(不足则不更新策略)
+
+walk_forward:
+  val_fraction: 0.3         # 验证集(最近、样本外)占比;仅在训练集挑参,用验证集汇报胜率
+
+# 虚拟账户(模拟实盘,确认真实胜率)
+account:
+  initial_capital: 100000   # 初始资金(元)
+  position_fraction: 0.2    # 每次建仓的目标仓位(占当前总权益比例)
+  max_position_fraction: 0.35  # 单仓硬上限(为买入高价股至少1手时的封顶)
+  allow_one_lot: true       # 预算不足1手,但现金与单仓上限允许时,至少买入1手(否则高价股永远买不进)
+  max_positions: 5          # 最大同时持仓数
+  commission_rate: 0.00025  # 佣金费率(买卖双边)
+  stamp_duty: 0.0005        # 印花税(仅卖出)
+  min_commission: 5         # 单笔最低佣金(元)
+  lot_size: 100             # 最小交易单位(股)
+  win_threshold: 0.0        # 平仓收益 > 该值记为一胜
+
+# 盘中实时循环
+live:
+  interval_seconds: 60      # 轮询间隔(秒)
+  select_time: "14:00"      # 下午该时间用实时数据选股,并挂"限价买单"(而非开盘无脑买)
+  entry_discount: 0.005     # 目标买入价 = 选股时现价 ×(1 - 该折扣);现价回调到该价才成交
+  pending_ttl_days: 2       # 限价买单未成交的有效期(自然日),超期自动撤单
+  morning: ["09:30", "11:30"]
+  afternoon: ["13:00", "15:00"]
+
+hist:
+  lookback_days: 400        # 拉取历史K线天数
+  adjust: qfq               # 复权:qfq 前复权 / hfq 后复权 / "" 不复权

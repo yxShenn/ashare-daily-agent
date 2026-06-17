@@ -1,0 +1,5 @@
+akshare>=1.16
+efinance>=0.5         # 个股资金流向(主力净流入),绕过被封的东财 akshare 接口
+pandas>=2.0
+numpy>=1.24
+PyYAML>=6.0
