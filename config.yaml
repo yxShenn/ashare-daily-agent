@@ -95,7 +95,7 @@ account:
 
 # 盘中实时循环
 live:
-  interval_seconds: 60      # 轮询间隔(秒)
+  interval_seconds: 5      # 轮询间隔(秒)
   select_time: "14:00"      # 下午该时间用实时数据选股,并挂"限价买单"(而非开盘无脑买)
   entry_discount: 0.005     # 目标买入价 = 选股时现价 ×(1 - 该折扣);现价回调到该价才成交
   pending_ttl_days: 2       # 限价买单未成交的有效期(自然日),超期自动撤单

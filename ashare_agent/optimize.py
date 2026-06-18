@@ -50,6 +50,10 @@ def _trade_return(i: int, opens, highs, lows, closes, ma, cfg: dict) -> float:
     return closes[end] / entry - 1
 
 
+def _progress(msg: str) -> None:
+    print(f"      {msg}", flush=True)
+
+
 def _build_panels(cfg: dict) -> list[tuple]:
     """返回按日期升序的 [(date, Z, success, ret)]:Z 为横截面标准化因子矩阵,
     success 为信号是否命中(holding_days 内达 success_threshold),
@@ -61,14 +65,23 @@ def _build_panels(cfg: dict) -> list[tuple]:
     name_lut = data.get_spot().set_index("symbol")["name"].to_dict()
     by_date: dict[np.datetime64, list] = {}
 
-    for sym in _sample_symbols(cfg):
+    symbols = _sample_symbols(cfg)
+    total = len(symbols)
+    n_ok = 0
+    _progress(f"拉取行情并构建回测面板 0/{total} ...")
+    for idx, sym in enumerate(symbols, 1):
         hist = data.get_hist(sym, cfg["hist"]["lookback_days"], cfg["hist"]["adjust"])
         if hist.empty or len(hist) < 80:
+            if idx == 1 or idx % 10 == 0 or idx == total:
+                _progress(f"拉取行情并构建回测面板 {idx}/{total} (已纳入{n_ok}) ...")
             continue
         choke, _ = serenity.membership(sym, name_lut.get(sym), None, cfg)
         ff = compute_factor_frame(hist, data.get_fund_flow(sym), mf_days, choke)
         if ff.empty:
+            if idx == 1 or idx % 10 == 0 or idx == total:
+                _progress(f"拉取行情并构建回测面板 {idx}/{total} (已纳入{n_ok}) ...")
             continue
+        n_ok += 1
         fvals = ff[FACTOR_NAMES].values
         opens = hist["open"].values
         highs = hist["high"].values
@@ -88,6 +101,8 @@ def _build_panels(cfg: dict) -> list[tuple]:
             max_gain = highs[win].max() / entry - 1
             ret = _trade_return(i, opens, highs, lows, closes, ma, cfg)
             by_date.setdefault(dates[i], []).append((row, max_gain >= target, ret))
+        if idx == 1 or idx % 10 == 0 or idx == total:
+            _progress(f"拉取行情并构建回测面板 {idx}/{total} (已纳入{n_ok}) ...")
 
     sel_dates = sorted(by_date.keys())[-int(cfg["optimize"]["window_days"]):]
     panels = []
@@ -101,6 +116,7 @@ def _build_panels(cfg: dict) -> list[tuple]:
         sd = F.std(0)
         sd[sd == 0] = 1.0
         panels.append((d, (F - F.mean(0)) / sd, S, R))
+    _progress(f"回测面板就绪: {len(panels)} 个交易日 (样本股 {n_ok}/{total})")
     return panels
 
 
@@ -157,13 +173,19 @@ def optimize(cfg: dict) -> dict:
     seed = int(_dt.date.today().strftime("%Y%m%d"))
     rng = np.random.default_rng(seed)
 
+    n_trials = int(cfg["optimize"]["n_trials"])
+    step = max(1, n_trials // 4)
     best_w, best_train = baseline.copy(), _eval(train, baseline, cfg)[0]
-    for _ in range(int(cfg["optimize"]["n_trials"])):
+    _progress(f"随机搜索权重 0/{n_trials} (训练集 {len(train)} 日) ...")
+    for t in range(n_trials):
         w = rng.uniform(0.0, 1.5, size=len(FACTOR_NAMES))
         sc, _m = _eval(train, w, cfg)
         if sc > best_train:
             best_train, best_w = sc, w
+        if t == 0 or (t + 1) % step == 0 or t + 1 == n_trials:
+            _progress(f"随机搜索权重 {t + 1}/{n_trials} ...")
 
+    _progress(f"验证样本外表现 (验证集 {len(val)} 日) ...")
     cand_val_score, cand_val = _eval(val, best_w, cfg)
     base_val_score, base_val = _eval(val, baseline, cfg)
     if cand_val_score >= base_val_score:
