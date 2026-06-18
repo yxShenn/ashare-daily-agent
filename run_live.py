@@ -19,7 +19,7 @@ import datetime as _dt
 import time
 
 from ashare_agent import (config, evaluate, optimize, paper_trade,
-                          portfolio, recommend, report, store)
+                          portfolio, recommend, report, store, trade_log)
 
 
 def _hm(now: _dt.datetime) -> str:
@@ -131,6 +131,7 @@ def run_eod(cfg: dict, today: str, evals: list, opt: dict, rec: dict | None) -> 
         print(f"  ⏭️  未建仓 {sk['name']}({sk['symbol']}):{sk['reason']}")
     print(f"  建仓 {len(entered)} 笔, 平仓 {len(closed)} 笔, 权益 {snap['equity']}, "
           f"回撤 {dd*100:.2f}%" + ("(熔断)" if settle['halted'] else ""))
+    print(f"  成交台账 {len(trade_log.load_all())} 笔 → {trade_log.TRADE_LOG_PATH}")
 
     text = report.build_report(cfg, rec, evals, opt, settle, today)
     print("\n" + "=" * 60)

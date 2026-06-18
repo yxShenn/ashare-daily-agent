@@ -80,7 +80,7 @@ def compute_factor_frame(df: pd.DataFrame, fund_flow: pd.DataFrame | None = None
     out["volume"] = vol.rolling(5).mean() / vol.rolling(20).mean().replace(0, np.nan)
     out["pullback"] = -((close / ma5) - 1).abs()
 
-    # 主力资金:近 mainflow_days 日主力净流入占比均值(点位安全,按日期对齐)
+    # 主力资金:近 mainflow_days 日主力净流入占比(%)均值 — 单位百分点,不是亿元
     if fund_flow is not None and not fund_flow.empty:
         s = fund_flow.set_index("date")["main_ratio"].sort_index()
         roll = s.rolling(mainflow_days, min_periods=1).mean()

@@ -11,13 +11,14 @@ from .factors import FACTOR_NAMES, compute_factor_frame
 from .strategy import score_cross_section
 
 
-def affordable_price_ceiling(cfg: dict) -> float:
+def affordable_price_ceiling(cfg: dict, price_lookup: dict | None = None) -> float:
     """按当前资金状态,能买入至少 1 手的最高单价(元/股)。
 
     允许买1手时以单仓上限 max_position_fraction 折算,否则以目标仓位 position_fraction。
+    price_lookup: 持仓市值用的实时价(与 Agent/tick 一致);缺省则按成本价估算。
     """
     a = cfg["account"]
-    eq = portfolio.equity({})
+    eq = portfolio.equity(price_lookup or {})
     frac = (float(a.get("max_position_fraction", a["position_fraction"]))
             if a.get("allow_one_lot", True) else float(a["position_fraction"]))
     return eq * frac / int(a["lot_size"])
@@ -78,20 +79,40 @@ def rank_candidates(cfg: dict) -> list[dict]:
     info = short.set_index("symbol")
 
     out: list[dict] = []
+    mf_days = int(cfg["run"].get("mainflow_days", 5))
     for sym in scores.index:
         binfo = info.loc[sym]
         brow = fdf.loc[sym]
+        mf_avg = round(float(brow["mainflow"]), 4)
         out.append({
             "symbol": sym,
             "name": str(binfo.get("name", "")),
-            "close": round(float(binfo["close"]), 3),
+            "close": round(float(binfo["close"]), 3),       # 稍后覆盖为实时价
             "pct": round(float(binfo["pct"]), 2),
             "amount_yi": round(float(binfo["amount"]), 2),
             "turnover": None if pd.isna(brow["turnover"]) else round(float(brow["turnover"]), 2),
             "score": round(float(scores[sym]), 4),
-            "serenity": serenity_hits.get(sym),     # 命中的卡脖子赛道标签(若有)
-            "factors": {c: round(float(brow[c]), 4) for c in FACTOR_NAMES},
+            "serenity": serenity_hits.get(sym),
+            "factors": {c: round(float(brow[c]), 4) for c in FACTOR_NAMES if c != "mainflow"},
+            "mainflow_ratio_nd_avg_pct": mf_avg,
+            "mainflow_note": (
+                f"近{mf_days}日主力净流入占比均值={mf_avg}% (百分点,不是亿元)"
+            ),
         })
+
+    # 候选价统一刷新为实时价(与成交 tick / 同花顺现价同源)
+    live = data.get_live_quotes([c["symbol"] for c in out])
+    for c in out:
+        q = live.get(c["symbol"])
+        if not q:
+            continue
+        price = float(q["price"])
+        c["current_price"] = round(price, 3)
+        c["close"] = c["current_price"]
+        c["price_source"] = q.get("source", "sina_realtime")
+        pc = float(q.get("prev_close") or 0)
+        if pc > 0:
+            c["pct"] = round((price / pc - 1) * 100, 2)
     return out
 
 

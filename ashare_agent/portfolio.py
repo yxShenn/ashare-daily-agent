@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 
 from .store import connect, init_db
+from . import trade_log
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS account (
@@ -66,6 +67,7 @@ def init_portfolio(cfg: dict) -> None:
                 "INSERT INTO account(id, initial_capital, cash) VALUES (1, ?, ?)",
                 (cap, cap),
             )
+    trade_log.ensure_synced()
 
 
 def get_account() -> dict:
@@ -146,7 +148,7 @@ def close_position(pos: dict, exit_price: float, exit_date: str,
     ret = pnl / float(pos["buy_cost"]) if pos["buy_cost"] else 0.0
     win = 1 if ret > float(a.get("win_threshold", 0.0)) else 0
     with connect() as con:
-        con.execute(
+        cur = con.execute(
             """INSERT INTO trades
                (symbol,name,shares,entry_price,entry_date,exit_price,exit_date,
                 buy_cost,net_proceeds,pnl,ret,reason,win)
@@ -155,10 +157,102 @@ def close_position(pos: dict, exit_price: float, exit_date: str,
              round(exit_price, 3), exit_date, pos["buy_cost"], round(net, 2),
              round(pnl, 2), round(ret, 4), reason, win),
         )
+        trade_id = cur.lastrowid
         con.execute("UPDATE account SET cash = cash + ? WHERE id=1", (net,))
         con.execute("DELETE FROM positions WHERE id=?", (pos["id"],))
+    trade_log.append(trade_id, {
+        "symbol": pos["symbol"], "name": pos["name"], "shares": shares,
+        "entry_price": pos["entry_price"], "entry_date": pos["entry_date"],
+        "buy_cost": pos["buy_cost"], "exit_price": round(exit_price, 3),
+        "exit_date": exit_date, "net_proceeds": round(net, 2),
+        "pnl": round(pnl, 2), "ret": round(ret, 4), "reason": reason, "win": win,
+    }, "平仓")
     return {"symbol": pos["symbol"], "name": pos["name"], "exit_price": round(exit_price, 3),
             "pnl": round(pnl, 2), "ret": round(ret, 4), "reason": reason, "win": win}
+
+
+def reduce_position(pos: dict, shares_to_sell: int, exit_price: float, exit_date: str,
+                    reason: str, cfg: dict) -> dict:
+    """部分减仓;shares_to_sell 须为整手且小于当前持仓,等于持仓时等同全平。"""
+    shares = int(pos["shares"])
+    shares_to_sell = int(shares_to_sell)
+    lot = int(cfg["account"]["lot_size"])
+    if shares_to_sell <= 0 or shares_to_sell > shares:
+        raise ValueError(f"减仓股数无效:{shares_to_sell}(当前{shares}股)")
+    if shares_to_sell % lot != 0:
+        raise ValueError(f"减仓须为 {lot} 股整数倍")
+    if shares_to_sell >= shares:
+        return close_position(pos, exit_price, exit_date, reason, cfg)
+
+    a = cfg["account"]
+    ratio = shares_to_sell / shares
+    sold_cost = float(pos["buy_cost"]) * ratio
+    gross = shares_to_sell * exit_price
+    commission = max(gross * a["commission_rate"], a["min_commission"])
+    stamp = gross * a["stamp_duty"]
+    net = gross - commission - stamp
+    pnl = net - sold_cost
+    ret = pnl / sold_cost if sold_cost else 0.0
+    win = 1 if ret > float(a.get("win_threshold", 0.0)) else 0
+    remaining = shares - shares_to_sell
+    with connect() as con:
+        cur = con.execute(
+            """INSERT INTO trades
+               (symbol,name,shares,entry_price,entry_date,exit_price,exit_date,
+                buy_cost,net_proceeds,pnl,ret,reason,win)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (pos["symbol"], pos["name"], shares_to_sell, pos["entry_price"], pos["entry_date"],
+             round(exit_price, 3), exit_date, round(sold_cost, 2), round(net, 2),
+             round(pnl, 2), round(ret, 4), reason, win),
+        )
+        trade_id = cur.lastrowid
+        con.execute(
+            "UPDATE positions SET shares=?, buy_cost=? WHERE id=?",
+            (remaining, round(float(pos["buy_cost"]) - sold_cost, 2), pos["id"]),
+        )
+        con.execute("UPDATE account SET cash = cash + ? WHERE id=1", (net,))
+    trade_log.append(trade_id, {
+        "symbol": pos["symbol"], "name": pos["name"], "shares": shares_to_sell,
+        "entry_price": pos["entry_price"], "entry_date": pos["entry_date"],
+        "buy_cost": round(sold_cost, 2), "exit_price": round(exit_price, 3),
+        "exit_date": exit_date, "net_proceeds": round(net, 2),
+        "pnl": round(pnl, 2), "ret": round(ret, 4), "reason": reason, "win": win,
+    }, "减仓")
+    return {"symbol": pos["symbol"], "name": pos["name"], "shares": shares_to_sell,
+            "exit_price": round(exit_price, 3), "pnl": round(pnl, 2),
+            "ret": round(ret, 4), "reason": reason, "win": win, "remaining": remaining}
+
+
+def add_shares(pos: dict, add_n: int, price: float, date: str, cfg: dict) -> dict:
+    """对已有持仓加仓(整手);更新加权成本与均价。"""
+    lot = int(cfg["account"]["lot_size"])
+    add_n = int(add_n)
+    if add_n <= 0 or add_n % lot != 0:
+        raise ValueError(f"加仓须为 {lot} 股整数倍")
+    a = cfg["account"]
+    gross = add_n * price
+    commission = max(gross * a["commission_rate"], a["min_commission"])
+    buy_cost = gross + commission
+    cash = get_account()["cash"]
+    if buy_cost > cash * 0.999:
+        raise ValueError(f"现金不足:需{buy_cost:,.0f}元,可用{cash:,.0f}元")
+
+    old_n = int(pos["shares"])
+    old_px = float(pos["entry_price"])
+    new_n = old_n + add_n
+    new_px = (old_n * old_px + add_n * price) / new_n
+    new_buy_cost = float(pos["buy_cost"]) + buy_cost
+    with connect() as con:
+        con.execute(
+            """UPDATE positions SET shares=?, entry_price=?, buy_cost=?, high_water=?
+               WHERE id=?""",
+            (new_n, round(new_px, 3), round(new_buy_cost, 2),
+             max(float(pos.get("high_water") or old_px), price), pos["id"]),
+        )
+        con.execute("UPDATE account SET cash = cash - ? WHERE id=1", (buy_cost,))
+    return {"symbol": pos["symbol"], "name": pos["name"], "added_shares": add_n,
+            "price": round(price, 3), "cost": round(buy_cost, 2),
+            "new_shares": new_n, "new_entry_price": round(new_px, 3)}
 
 
 def recent_trades(limit: int = 10) -> list[dict]:

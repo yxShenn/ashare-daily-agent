@@ -111,6 +111,85 @@ def get_realtime(symbols: list[str]) -> dict[str, dict]:
     return out
 
 
+def get_live_quotes(symbols: list[str]) -> dict[str, dict]:
+    """与成交 tick 同源的新浪实时报价(hq.sinajs.cn);缺失时回退 spot 并标记 source。
+
+    返回 {symbol: {name, price, prev_close, open, high, low, source}}。
+    source: sina_realtime | spot_fallback
+    """
+    syms = list(dict.fromkeys(s for s in symbols if s))
+    if not syms:
+        return {}
+    out = get_realtime(syms)
+    missing = [s for s in syms if s not in out]
+    if missing:
+        spot = get_spot().set_index("symbol")
+        for s in missing:
+            if s not in spot.index:
+                continue
+            row = spot.loc[s]
+            price = float(row.get("close") or 0)
+            if price <= 0:
+                continue
+            pc = float(row.get("prev_close") or price)
+            out[s] = {
+                "name": str(row.get("name", "")),
+                "price": price,
+                "prev_close": pc,
+                "open": float(row.get("open") or price),
+                "high": float(row.get("high") or price),
+                "low": float(row.get("low") or price),
+                "source": "spot_fallback",
+            }
+    for q in out.values():
+        q.setdefault("source", "sina_realtime")
+    return out
+
+
+def get_live_price(symbol: str) -> float | None:
+    q = get_live_quotes([symbol]).get(symbol)
+    return None if not q else float(q["price"])
+
+
+def fund_flow_recent(symbol: str, days: int = 5) -> list[dict]:
+    """最近 N 日主力资金流向(efinance),字段带明确单位。"""
+    ff = get_fund_flow(symbol)
+    if ff.empty:
+        return []
+    rows: list[dict] = []
+    for _, r in ff.tail(int(days)).iterrows():
+        d = r["date"].strftime("%Y-%m-%d") if hasattr(r["date"], "strftime") else str(r["date"])
+        net = r.get("main_net")
+        ratio = r.get("main_ratio")
+        net_f = None if pd.isna(net) else float(net)
+        ratio_f = None if pd.isna(ratio) else float(ratio)
+        rows.append({
+            "date": d,
+            "main_net_yuan": net_f,
+            "main_net_yi": round(net_f / 1e8, 2) if net_f is not None else None,
+            "main_ratio_pct": round(ratio_f, 2) if ratio_f is not None else None,
+        })
+    return rows
+
+
+def agent_field_legend(cfg: dict | None = None) -> dict:
+    """Agent 工具返回字段的单位说明(防误读)。"""
+    mf_days = int((cfg or {}).get("run", {}).get("mainflow_days", 5))
+    return {
+        "current_price": "新浪实时价(元/股),与成交 tick 同源;决策现价以此为准",
+        "last_daily_close": "最近一根日K收盘价(元);可能滞后于 current_price",
+        "pct": "相对昨收的涨跌幅(%)",
+        "amount_yi": "成交额(亿元)",
+        "turnover": "换手率(%)",
+        "score": "多因子横截面 z-score 加权综合分(无量纲),不是涨跌幅",
+        "mainflow_ratio_nd_avg_pct": (
+            f"近{mf_days}日「主力净流入占比」的算术平均,单位百分点(%),不是亿元"
+        ),
+        "fund_flow_recent": "逐日主力净流入:main_net_yi=亿元,main_ratio_pct=占成交额%",
+        "price_source": "sina_realtime=实时接口;spot_fallback=实时不可用时的快照兜底",
+    }
+
+
 def get_hist(symbol: str, lookback_days: int = 400, adjust: str = "qfq") -> pd.DataFrame:
     """个股日线历史K线(新浪源,标准化英文列,按日期升序)。无数据返回空 DataFrame。
 

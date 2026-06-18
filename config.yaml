@@ -3,10 +3,10 @@
 
 run:
   holding_days: 5            # 信号评估窗口(交易日),仅用于"命中率"统计与优化的winrate目标
-  success_threshold: 0.10   # 信号命中判定:买入后 holding_days 内涨幅达到 10%
+  success_threshold: 0.07   # 信号命中判定:买入后 holding_days 内涨幅达到 10%
   stop_loss: -0.05          # 硬止损线(本金保护,智能出场也以此为底线)
   top_candidates: 80        # 预筛候选数(仅对这些股票计算技术因子,懒加载)
-  mainflow_days: 5          # 主力净流入因子:近 N 日主力净流入占比均值
+  mainflow_days: 5          # 主力因子:近 N 日主力净流入「占比(%)」均值(不是亿元)
 
 # 智能动态出场(替代机械的固定止盈/到期):让盈利奔跑,亏损与走坏快速离场
 exit:
@@ -38,7 +38,7 @@ factors:
   momentum: 1.0            # 中期动量
   volume: 0.8              # 量能放大
   pullback: 0.5            # 回踩不追高
-  mainflow: 1.0           # 主力资金净流入(近5日占比均值,大资金流向)
+  mainflow: 1.0           # 主力净流入占比(近5日%均值,单位百分点;不是亿元)
   serenity: 1.0           # 卡脖子赛道成员(0/1);权重由 walk-forward 优化器自动学习/调整
 
 # Serenity 卡脖子赛道:仅定义"哪些算卡脖子赛道"(定性清单,Serenity 思想);
@@ -110,14 +110,16 @@ hist:
 # 密钥从 .env 的 DEEPSEEK_API_KEY 读取,不写进本文件。
 agent:
   enabled: true
-  provider: deepseek                       # 目前支持 deepseek(OpenAI 兼容接口)
-  model: deepseek-chat                     # 可被环境变量 DEEPSEEK_MODEL 覆盖
-  base_url: https://api.deepseek.com/v1    # 可被环境变量 DEEPSEEK_BASE_URL 覆盖
-  temperature: 0.3                         # 决策温度(偏低更稳健)
-  max_iters: 12                            # 单次决策的最大工具调用轮数(成本/防失控上限)
-  timeout_seconds: 120                     # 单次 LLM 调用超时
-  skills_dir: skills                       # 技能目录(相对项目根)
-  candidates_topn: 25                      # 喂给 LLM 的候选股数量上限
-  # 各决策点开关:关掉则回退到确定性引擎的对应逻辑
-  decide_select: true                      # 由 agent 决定选股+目标买入价
-  decide_exit: true                        # 由 agent 决定自由裁量出场(硬止损始终由代码强制)
+  autonomous: true                         # 完全自主:无固定14:00建仓、无机械持有期/止盈规则
+  auto_exits: false                        # false=仅保留-5%硬止损,其余出场由 Agent 决策
+  provider: deepseek
+  model: deepseek-chat
+  base_url: https://api.deepseek.com/v1
+  temperature: 0.3
+  max_iters: 16                            # 自主调研+交易需更多工具轮次
+  timeout_seconds: 120
+  skills_dir: skills
+  candidates_topn: 25
+  trade_interval_minutes: 15               # 盘中自主决策间隔(分钟),开盘后立即首次执行
+  signal_eval_days: 999                    # 台账统计用,不触发机械卖出
+  run_optimize: true                       # 启动时 walk-forward(仅为候选 score 参考)

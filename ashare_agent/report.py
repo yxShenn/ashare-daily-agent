@@ -5,12 +5,15 @@ import datetime as _dt
 import json
 
 from .config import REPORT_DIR, ensure_dirs
-from . import store, portfolio, exits
+from . import store, portfolio, exits, trade_log
 
 
-_PHASE_ZH = {"review": "开盘复盘", "select": "择时选股", "exit": "盘中离场"}
+_PHASE_ZH = {"review": "开盘复盘", "trade": "自主交易", "select": "自主交易",
+             "manage": "自主交易", "exit": "自主交易"}
 _ACTION_ZH = {
     "place_order": lambda a: f"挂买单 {a.get('name','')}({a['symbol']}) @ {a['limit_price']} —— {a.get('reason','')}",
+    "add": lambda a: f"加仓 {a.get('name','')}({a['symbol']}) {a.get('shares')}股 @ {a.get('price')} —— {a.get('reason','')}",
+    "reduce": lambda a: f"减仓 {a['symbol']} {a.get('shares')}股 @ {a.get('exit_price')} ({a.get('ret',0)*100:+.2f}%) —— {a.get('reason','')}",
     "cancel_order": lambda a: f"撤单 {a['symbol']}",
     "close": lambda a: f"平仓 {a['symbol']} @ {a.get('exit_price')} ({a.get('ret',0)*100:+.2f}%) —— {a.get('reason','')}",
     "remember": lambda a: f"记忆:{a.get('note','')}",
@@ -39,7 +42,8 @@ def _append_agent_section(lines: list[str], agent) -> None:
 def build_report(cfg: dict, rec: dict | None, evals: list[dict],
                  opt: dict, settle: dict | None, run_date: str, agent=None) -> str:
     s = store.stats()
-    pf = portfolio.stats()
+    px_lookup = settle.get("prices") if settle else None
+    pf = portfolio.stats(px_lookup)
     lines: list[str] = []
     lines.append(f"# A股每日选股日报 · {run_date}\n")
 
@@ -66,7 +70,13 @@ def build_report(cfg: dict, rec: dict | None, evals: list[dict],
         lines.append(f"- **成交额**:{reason.get('amount_yi')} 亿元 | "
                      f"换手:{reason.get('turnover')}%")
         fac = reason.get("factors", {})
-        fac_str = ", ".join(f"{k}={v}" for k, v in fac.items())
+        parts = []
+        for k, v in fac.items():
+            if k == "mainflow":
+                parts.append(f"mainflow={v}% (占比均值,非亿元)")
+            else:
+                parts.append(f"{k}={v}")
+        fac_str = ", ".join(parts)
         lines.append(f"- **因子值**:{fac_str}\n")
 
     # 1.5 Agent 决策摘要(仅 LLM 主导模式;run_live 不传 agent 时跳过)
@@ -156,7 +166,8 @@ def build_report(cfg: dict, rec: dict | None, evals: list[dict],
                  f"现金:{pf['cash']:.2f} | 持仓:{pf['open_positions']} 笔 | "
                  f"已实现盈亏:{pf['realized_pnl']:.2f} 元")
     lines.append(f"- 已平仓交易:**{pf['closed_trades']}** 笔 | 盈利:**{pf['wins']}** 笔 | "
-                 f"**胜率:{pf['winrate']*100:.1f}%** | 单笔平均收益:{pf['avg_trade_ret']*100:.2f}%\n")
+                 f"**胜率:{pf['winrate']*100:.1f}%** | 单笔平均收益:{pf['avg_trade_ret']*100:.2f}%")
+    lines.append(f"- 完整成交台账:**{trade_log.TRADE_LOG_PATH}** (成本价/卖出价/盈亏等)\n")
 
     # 6. 信号命中率(选股模型本身,非账户)
     lines.append("## 6. 选股信号命中率(5日内最高涨幅≥目标)\n")

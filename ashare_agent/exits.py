@@ -30,10 +30,14 @@ def evaluate_exit(state: dict, bar: dict, is_eod: bool, cfg: dict) -> tuple[str 
     entry = state["entry_price"]
     hw = max(state["high_water"], bar["high"])
 
-    # 1. 硬止损
+    # 1. 硬止损(本金保护,Agent 自主模式下仍保留)
     stop_price = entry * (1 + float(cfg["run"]["stop_loss"]))
     if bar["low"] <= stop_price:
         return "stop", stop_price
+
+    # Agent 自主模式:关闭移动止盈/均线/级联/最长持仓等机械出场,由 Agent 决策卖时点
+    if cfg.get("agent", {}).get("auto_exits") is False:
+        return None, bar["close"]
 
     # 2. 移动止盈
     if hw / entry - 1 >= float(e["trail_activate"]):

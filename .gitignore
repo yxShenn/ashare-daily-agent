@@ -16,3 +16,4 @@ data/active_config.json
 data/strategy_history.jsonl
 data/agent_trace/
 data/agent_memory.jsonl
+data/trades.csv

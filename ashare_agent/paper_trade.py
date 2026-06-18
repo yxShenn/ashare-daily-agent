@@ -146,7 +146,7 @@ def _ma_upto(h: pd.DataFrame, n: int) -> float | None:
 def build_live_quotes(symbols: list[str], cfg) -> dict[str, dict]:
     """从实时报价构造行情 + 趋势均线(盘中用;ma 取最近 trend_ma 日收盘)。"""
     syms = list(set(symbols))
-    rt = data.get_realtime(syms)
+    rt = data.get_live_quotes(syms)
     n = int(cfg["exit"]["trend_ma"])
     out = {}
     for s, q in rt.items():

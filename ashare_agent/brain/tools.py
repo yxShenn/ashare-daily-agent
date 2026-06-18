@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import math
 
 from .. import data, portfolio, recommend, store
 from . import memory
@@ -90,6 +91,7 @@ class ToolKit:
             pending_orders=[{"symbol": p["symbol"], "name": p["name"],
                              "limit_price": p["limit_price"], "rec_date": p["rec_date"]}
                             for p in pendings],
+            price_note="positions.current_price 为新浪实时价,与成交 tick 同源",
         )
 
     def _t_get_market_overview(self) -> dict:
@@ -105,15 +107,20 @@ class ToolKit:
             avg_pct=round(float(pct.mean()), 2) if len(pct) else None,
             median_pct=round(float(pct.median()), 2) if len(pct) else None,
             total_amount_yi=round(float(df["amount"].sum()) / 1e8, 1),
+            note="广度统计基于全市场 spot 快照(非逐股实时);个股现价请用 get_stock_detail/current_price",
         )
 
     def _t_get_candidates(self, topn: int | None = None) -> dict:
         n = int(topn or self.cfg.get("agent", {}).get("candidates_topn", 25))
         cands = recommend.rank_candidates(self.cfg)
-        ceiling = recommend.affordable_price_ceiling(self.cfg)
+        px = self._quotes([c["symbol"] for c in cands[:n]])
+        ceiling = recommend.affordable_price_ceiling(self.cfg, px)
+        legend = data.agent_field_legend(self.cfg)
         return _ok(
             affordable_price_ceiling=round(ceiling, 2),
-            note="score 为确定性多因子打分(仅供参考,你可自由取舍);close 已过可买性过滤",
+            field_legend=legend,
+            price_note="close/current_price 为新浪实时价,与成交 tick 同源;决策现价以此为准",
+            mainflow_note="mainflow_ratio_nd_avg_pct 与 factors 中已移除的 mainflow 同义,单位百分点(%),不是亿元",
             candidates=cands[:n],
         )
 
@@ -125,24 +132,56 @@ class ToolKit:
         hist = data.get_hist(symbol, self.cfg["hist"]["lookback_days"], self.cfg["hist"]["adjust"])
         if hist.empty:
             return _err(f"{symbol} 无历史K线(可能停牌/不支持的板块)")
+        mf_days = int(self.cfg["run"].get("mainflow_days", 5))
         tail = hist.tail(20)
         closes = tail["close"].tolist()
-        last = float(closes[-1])
+        last_bar = hist.iloc[-1]
+        last_daily_close = float(last_bar["close"])
+        last_daily_date = (
+            last_bar["date"].strftime("%Y-%m-%d")
+            if hasattr(last_bar["date"], "strftime") else str(last_bar["date"])
+        )
+        live = data.get_live_quotes([symbol]).get(symbol, {})
+        current = live.get("price")
+        pc = float(live.get("prev_close") or 0)
+        pct_live = round((float(current) / pc - 1) * 100, 2) if current and pc > 0 else None
         ma = {f"ma{n}": (round(float(hist['close'].tail(n).mean()), 3) if len(hist) >= n else None)
               for n in (5, 10, 20)}
         choke, theme = serenity.membership(symbol, None, None, self.cfg)
-        ff = compute_factor_frame(hist, data.get_fund_flow(symbol),
-                                  int(self.cfg["run"].get("mainflow_days", 5)), choke)
+        ff = compute_factor_frame(hist, data.get_fund_flow(symbol), mf_days, choke)
         factors = {}
+        mf_avg = None
         if not ff.empty:
             row = ff.iloc[-1]
-            factors = {c: (None if row[c] != row[c] else round(float(row[c]), 4)) for c in FACTOR_NAMES}
-        ret5 = round((last / float(closes[-6]) - 1) * 100, 2) if len(closes) >= 6 else None
-        ret20 = round((last / float(tail.iloc[0]["close"]) - 1) * 100, 2)
+            factors = {
+                c: (None if row[c] != row[c] else round(float(row[c]), 4))
+                for c in FACTOR_NAMES if c != "mainflow"
+            }
+            mf_avg = round(float(row["mainflow"]), 4) if row.get("mainflow") == row.get("mainflow") else None
+        ret5 = round((last_daily_close / float(closes[-6]) - 1) * 100, 2) if len(closes) >= 6 else None
+        ret20 = round((last_daily_close / float(tail.iloc[0]["close"]) - 1) * 100, 2)
+        name = str(live.get("name") or "")
+        if not name:
+            spot = data.get_spot().set_index("symbol")
+            if symbol in spot.index:
+                name = str(spot.loc[symbol].get("name", ""))
         return _ok(
-            symbol=symbol, last_close=last,
+            symbol=symbol, name=name,
+            current_price=round(float(current), 3) if current else None,
+            price_source=live.get("source"),
+            pct_vs_prev_close=pct_live,
+            last_daily_close=round(last_daily_close, 3),
+            last_daily_date=last_daily_date,
             ret_5d_pct=ret5, ret_20d_pct=ret20, **ma,
-            serenity_theme=theme, factors=factors,
+            serenity_theme=theme,
+            factors=factors,
+            mainflow_ratio_nd_avg_pct=mf_avg,
+            mainflow_note=(
+                f"近{mf_days}日主力净流入占比均值={mf_avg}% (百分点,不是亿元)"
+                if mf_avg is not None else None
+            ),
+            fund_flow_recent=data.fund_flow_recent(symbol, mf_days),
+            field_legend=data.agent_field_legend(self.cfg),
             recent_closes=[round(float(c), 3) for c in closes[-10:]],
         )
 
@@ -176,23 +215,29 @@ class ToolKit:
             return _err("limit_price 必须 > 0")
 
         # 回撤熔断
-        if portfolio.current_drawdown(self._quotes([])) >= float(self.cfg["risk"]["max_drawdown"]):
+        if portfolio.current_drawdown(self._portfolio_px()) >= float(self.cfg["risk"]["max_drawdown"]):
             return _err("账户已触发回撤熔断,暂停建仓(本金保护)")
 
-        # 标的有效性 + 现价(用于限价合理性校验)
-        spot = data.get_spot().set_index("symbol")
-        if symbol not in spot.index:
-            return _err(f"{symbol} 不在全市场快照内(代码错误/停牌/北交所)")
-        info = spot.loc[symbol]
-        name = str(info.get("name", ""))
-        cur = float(info.get("close") or 0)
+        # 标的有效性 + 现价(与成交 tick 同源)
+        live = data.get_live_quotes([symbol]).get(symbol)
+        if not live or not live.get("price"):
+            spot = data.get_spot().set_index("symbol")
+            if symbol not in spot.index:
+                return _err(f"{symbol} 不在全市场快照内(代码错误/停牌/北交所)")
+            return _err(f"{symbol} 无法获取实时价,请稍后再试")
+        name = str(live.get("name", ""))
+        if not name:
+            spot = data.get_spot().set_index("symbol")
+            if symbol in spot.index:
+                name = str(spot.loc[symbol].get("name", ""))
+        cur = float(live["price"])
         if cur <= 0:
             return _err(f"{symbol} 无有效现价")
         if not (cur * 0.8 <= limit_price <= cur * 1.1):
             return _err(f"限价 {limit_price} 偏离现价 {cur} 过大(允许区间 现价×[0.8,1.1])")
 
-        # 可买性
-        ceiling = recommend.affordable_price_ceiling(self.cfg)
+        px = self._quotes([p["symbol"] for p in portfolio.get_positions("open")])
+        ceiling = recommend.affordable_price_ceiling(self.cfg, px)
         if cur > ceiling:
             return _err(f"{symbol} 现价 {cur} 高于可买上限 {round(ceiling,2)}(资金不足买1手)")
 
@@ -205,10 +250,12 @@ class ToolKit:
         if len(opens) + len(pendings) >= int(a["max_positions"]):
             return _err(f"持仓+挂单已达上限 {a['max_positions']},不再新开")
 
+        hold = int(self.cfg.get("agent", {}).get("signal_eval_days")
+                 or self.cfg["run"]["holding_days"])
         rec = {
             "rec_date": self.today, "symbol": symbol, "name": name,
             "entry_close": round(cur, 3), "limit_price": round(limit_price, 2),
-            "score": None, "holding_days": int(self.cfg["run"]["holding_days"]),
+            "score": None, "holding_days": hold,
             "target": float(self.cfg["run"]["success_threshold"]),
             "stop_loss": float(self.cfg["run"]["stop_loss"]),
             "reason": json.dumps({"by": "agent", "rationale": reason}, ensure_ascii=False),
@@ -220,7 +267,8 @@ class ToolKit:
         self.actions.append({"type": "place_order", "symbol": symbol, "name": name,
                              "limit_price": round(limit_price, 2), "reason": reason})
         return _ok(symbol=symbol, name=name, limit_price=round(limit_price, 2),
-                   current_price=cur, msg="限价买单已挂,现价回调到目标价才成交")
+                   current_price=round(cur, 3), price_source=live.get("source"),
+                   msg="限价买单已挂,现价回调到目标价才成交")
 
     def _t_cancel_order(self, symbol: str) -> dict:
         symbol = str(symbol).strip()
@@ -249,6 +297,83 @@ class ToolKit:
                    pnl=closed["pnl"], return_pct=round(closed["ret"] * 100, 2),
                    msg="已平仓")
 
+    def _t_reduce_position(self, symbol: str, shares: int, reason: str = "") -> dict:
+        """部分减仓(整手);shares 等于全部持仓时等同全平。"""
+        symbol = str(symbol).strip()
+        pos = next((p for p in portfolio.get_positions("open") if p["symbol"] == symbol), None)
+        if pos is None:
+            return _err(f"{symbol} 不在持仓中")
+        if pos["entry_date"] >= self.today:
+            return _err(f"{symbol} 当日买入,T+1 次日才可卖出")
+        px = self._quotes([symbol]).get(symbol)
+        if not px:
+            return _err(f"{symbol} 未取到实时价,稍后再试")
+        try:
+            shares = int(shares)
+            result = portfolio.reduce_position(pos, shares, px, self.today, "agent", self.cfg)
+        except ValueError as e:
+            return _err(str(e))
+        self.actions.append({"type": "reduce", "symbol": symbol, "shares": result.get("shares", shares),
+                             "exit_price": result["exit_price"], "ret": result["ret"], "reason": reason})
+        return _ok(symbol=symbol, shares=result.get("shares"), exit_price=result["exit_price"],
+                   pnl=result["pnl"], return_pct=round(result["ret"] * 100, 2),
+                   remaining=result.get("remaining"), msg="已部分减仓")
+
+    def _t_add_to_position(self, symbol: str, limit_price: float, reason: str = "") -> dict:
+        """对已持仓标的加仓;现价≤限价时按单仓上限与现金预算买入整手。"""
+        symbol = str(symbol).strip()
+        pos = next((p for p in portfolio.get_positions("open") if p["symbol"] == symbol), None)
+        if pos is None:
+            return _err(f"{symbol} 不在持仓中,请用 place_limit_order 新建仓")
+        try:
+            limit_price = float(limit_price)
+        except (TypeError, ValueError):
+            return _err("limit_price 必须为数字")
+        if limit_price <= 0:
+            return _err("limit_price 必须 > 0")
+        if portfolio.current_drawdown(self._portfolio_px()) >= float(self.cfg["risk"]["max_drawdown"]):
+            return _err("账户已触发回撤熔断,暂停加仓")
+
+        cur = self._quotes([symbol]).get(symbol)
+        if not cur:
+            return _err(f"{symbol} 未取到实时价,稍后再试")
+        if not (cur * 0.8 <= limit_price <= cur * 1.1):
+            return _err(f"限价 {limit_price} 偏离现价 {cur} 过大(允许区间 现价×[0.8,1.1])")
+        if cur > limit_price:
+            return _ok(symbol=symbol, current_price=cur, limit_price=round(limit_price, 2),
+                       msg=f"等待回调:现价 {cur:.2f} > 目标加仓价 {limit_price:.2f}")
+
+        add_n, err = self._calc_add_shares(symbol, cur, pos)
+        if err:
+            return _err(err)
+        try:
+            result = portfolio.add_shares(pos, add_n, cur, self.today, self.cfg)
+        except ValueError as e:
+            return _err(str(e))
+        self.actions.append({"type": "add", "symbol": symbol, "name": pos["name"],
+                             "shares": add_n, "price": result["price"], "reason": reason})
+        return _ok(symbol=symbol, added_shares=add_n, price=result["price"],
+                   new_shares=result["new_shares"], msg="已加仓")
+
+    def _calc_add_shares(self, symbol: str, price: float, pos: dict) -> tuple[int, str | None]:
+        """计算可加仓股数(整手);受单仓上限与现金约束。"""
+        a = self.cfg["account"]
+        lot = int(a["lot_size"])
+        px = self._portfolio_px()
+        eq = portfolio.equity(px)
+        max_frac = float(a.get("max_position_fraction", a["position_fraction"]))
+        cap = eq * max_frac
+        current_mv = int(pos["shares"]) * price
+        room = cap - current_mv
+        if room < price * lot:
+            return 0, f"单仓已达上限(≈{cap:,.0f}元),无法再加仓"
+        cash = portfolio.get_account()["cash"]
+        budget = min(cash * 0.999, room, eq * float(a["position_fraction"]))
+        add_n = int(math.floor(budget / (price * lot)) * lot)
+        if add_n < lot:
+            return 0, f"预算不足1手(可用≈{budget:,.0f}元,1手需≈{price * lot:,.0f}元)"
+        return add_n, None
+
     def _t_remember(self, note: str, tags: list[str] | None = None) -> dict:
         note = str(note).strip()
         if not note:
@@ -259,34 +384,37 @@ class ToolKit:
 
     # ---------------- 内部:实时报价(带本周期缓存) ----------------
 
+    def _portfolio_px(self) -> dict[str, float]:
+        return self._quotes([p["symbol"] for p in portfolio.get_positions("open")])
+
     def _quotes(self, symbols: list[str]) -> dict[str, float]:
         need = [s for s in symbols if s not in self._price_cache]
         if need:
-            for s, q in data.get_realtime(need).items():
-                self._price_cache[s] = q["price"]
+            for s, q in data.get_live_quotes(need).items():
+                self._price_cache[s] = float(q["price"])
         return {s: self._price_cache[s] for s in symbols if s in self._price_cache}
 
 
 _BASE_SCHEMAS: list[dict] = [
     {"type": "function", "function": {
         "name": "get_portfolio_state",
-        "description": "查看虚拟账户当前状态:现金、总权益、回撤、持仓(含浮盈/是否可卖T+1)、挂单。",
+        "description": "查看虚拟账户:现金、总权益、回撤、持仓(current_price=新浪实时价,与成交 tick 同源)、挂单。",
         "parameters": {"type": "object", "properties": {}},
     }},
     {"type": "function", "function": {
         "name": "get_market_overview",
-        "description": "全市场情绪概览:涨跌家数、平均涨跌幅、涨停数、总成交额。",
+        "description": "全市场情绪概览(涨跌家数/均涨跌幅/成交额;广度统计,非逐股实时价)。",
         "parameters": {"type": "object", "properties": {}},
     }},
     {"type": "function", "function": {
         "name": "get_candidates",
-        "description": "获取经风控+可买性过滤后的候选股列表及其多因子打分(确定性引擎产出,供你参考,你可自由取舍)。",
+        "description": "候选股列表:close/current_price=实时价;mainflow_ratio_nd_avg_pct=占比(%);详见 field_legend。",
         "parameters": {"type": "object", "properties": {
             "topn": {"type": "integer", "description": "返回数量上限,默认取配置 candidates_topn"}}},
     }},
     {"type": "function", "function": {
         "name": "get_stock_detail",
-        "description": "查看单只股票细节:最近收盘、5/20日涨幅、均线、各因子值、卡脖子赛道标签、近10日收盘序列。",
+        "description": "个股详情:current_price(实时现价)、last_daily_close(日K,非现价)、fund_flow_recent(金额亿/占比%)、因子与均线。",
         "parameters": {"type": "object", "properties": {
             "symbol": {"type": "string", "description": "6位A股代码,如 600519"}},
             "required": ["symbol"]},
@@ -325,11 +453,29 @@ _BASE_SCHEMAS: list[dict] = [
     }},
     {"type": "function", "function": {
         "name": "close_position",
-        "description": "按当前实时价平掉某只持仓(自由裁量出场;硬止损由系统自动执行,无需你操作)。受T+1约束。",
+        "description": "按当前实时价全部平仓(自由裁量止盈/止损;硬止损由系统自动执行)。受T+1约束。",
         "parameters": {"type": "object", "properties": {
             "symbol": {"type": "string"},
             "reason": {"type": "string", "description": "卖出理由(简短)"}},
             "required": ["symbol"]},
+    }},
+    {"type": "function", "function": {
+        "name": "reduce_position",
+        "description": "部分减仓(整手);用于分批止盈/控风险。shares 等于全部持仓时等同全平。受T+1约束。",
+        "parameters": {"type": "object", "properties": {
+            "symbol": {"type": "string"},
+            "shares": {"type": "integer", "description": "卖出股数(须为100整数倍)"},
+            "reason": {"type": "string", "description": "减仓理由(简短)"}},
+            "required": ["symbol", "shares"]},
+    }},
+    {"type": "function", "function": {
+        "name": "add_to_position",
+        "description": "对已持仓标的加仓(现价≤限价时成交);受单仓上限与现金约束,须为整手。",
+        "parameters": {"type": "object", "properties": {
+            "symbol": {"type": "string", "description": "已在持仓中的6位代码"},
+            "limit_price": {"type": "number", "description": "目标加仓价(现价≤该价才买入)"},
+            "reason": {"type": "string", "description": "加仓理由(简短)"}},
+            "required": ["symbol", "limit_price"]},
     }},
     {"type": "function", "function": {
         "name": "remember",
