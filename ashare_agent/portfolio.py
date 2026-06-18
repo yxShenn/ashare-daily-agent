@@ -161,6 +161,18 @@ def close_position(pos: dict, exit_price: float, exit_date: str,
             "pnl": round(pnl, 2), "ret": round(ret, 4), "reason": reason, "win": win}
 
 
+def recent_trades(limit: int = 10) -> list[dict]:
+    """最近已平仓交易(按平仓时间倒序),供 agent 复盘反思用。"""
+    with connect() as con:
+        rows = con.execute(
+            """SELECT symbol, name, shares, entry_price, entry_date, exit_price,
+                      exit_date, pnl, ret, reason, win
+               FROM trades ORDER BY id DESC LIMIT ?""",
+            (int(limit),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def market_value(price_lookup: dict[str, float]) -> float:
     mv = 0.0
     for p in get_positions("open"):

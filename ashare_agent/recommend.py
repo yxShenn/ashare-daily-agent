@@ -23,20 +23,23 @@ def affordable_price_ceiling(cfg: dict) -> float:
     return eq * frac / int(a["lot_size"])
 
 
-def run_recommend(cfg: dict, rec_date: str | None = None) -> dict | None:
-    """执行选股,写入台账并返回推荐详情。无可选标的返回 None。"""
+def rank_candidates(cfg: dict) -> list[dict]:
+    """风控池 -> 可买性过滤 -> 成交额预筛 -> 多因子打分,返回按分数降序的候选列表。
+
+    每个候选:{symbol, name, close, pct, amount_yi, turnover, score, serenity, factors}。
+    选股(run_recommend)与 agent 候选工具(brain.tools)共用此函数(DRY)。
+    """
     weights = cfg["factors"]
-    rec_date = rec_date or _dt.date.today().strftime("%Y-%m-%d")
 
     pool = universe.build_universe(cfg)
     if pool.empty:
-        return None
+        return []
 
     # 资金可买性过滤:剔除当前资金买不起 1 手的高价股(不要先推荐再撤单)
     ceiling = affordable_price_ceiling(cfg)
     pool = pool[pool["close"] <= ceiling]
     if pool.empty:
-        return None
+        return []
 
     # 预筛:按成交额(流动性/资金关注度)取 top_candidates,再算技术因子(懒加载)
     n = int(cfg["run"]["top_candidates"])
@@ -68,29 +71,53 @@ def run_recommend(cfg: dict, rec_date: str | None = None) -> dict | None:
             **{c: float(last[c]) for c in FACTOR_NAMES},
         })
     if not rows:
-        return None
+        return []
 
     fdf = pd.DataFrame(rows).set_index("symbol")
     scores = score_cross_section(fdf, weights).sort_values(ascending=False)
+    info = short.set_index("symbol")
 
-    best = scores.index[0]
-    binfo = short.set_index("symbol").loc[best]
-    brow = fdf.loc[best]
+    out: list[dict] = []
+    for sym in scores.index:
+        binfo = info.loc[sym]
+        brow = fdf.loc[sym]
+        out.append({
+            "symbol": sym,
+            "name": str(binfo.get("name", "")),
+            "close": round(float(binfo["close"]), 3),
+            "pct": round(float(binfo["pct"]), 2),
+            "amount_yi": round(float(binfo["amount"]), 2),
+            "turnover": None if pd.isna(brow["turnover"]) else round(float(brow["turnover"]), 2),
+            "score": round(float(scores[sym]), 4),
+            "serenity": serenity_hits.get(sym),     # 命中的卡脖子赛道标签(若有)
+            "factors": {c: round(float(brow[c]), 4) for c in FACTOR_NAMES},
+        })
+    return out
+
+
+def run_recommend(cfg: dict, rec_date: str | None = None) -> dict | None:
+    """执行选股(确定性 Top1),写入台账并返回推荐详情。无可选标的返回 None。"""
+    rec_date = rec_date or _dt.date.today().strftime("%Y-%m-%d")
+    cands = rank_candidates(cfg)
+    if not cands:
+        return None
+
+    best = cands[0]
     reason = {
-        "score": round(float(scores.iloc[0]), 4),
-        "serenity": serenity_hits.get(best),   # 命中的卡脖子赛道标签(若有)
-        "factors": {c: round(float(brow[c]), 4) for c in FACTOR_NAMES},
-        "turnover": None if pd.isna(brow["turnover"]) else round(float(brow["turnover"]), 2),
-        "amount_yi": round(float(binfo["amount"]), 2),
-        "pct": round(float(binfo["pct"]), 2),
+        "score": best["score"],
+        "serenity": best["serenity"],
+        "factors": best["factors"],
+        "turnover": best["turnover"],
+        "amount_yi": best["amount_yi"],
+        "pct": best["pct"],
     }
-    ref_price = float(binfo["close"])                       # 选股时(实时)参考价
+    ref_price = float(best["close"])                        # 选股时(实时)参考价
     discount = float(cfg.get("live", {}).get("entry_discount", 0.0))
     limit_price = round(ref_price * (1 - discount), 2)       # 目标买入价(限价)
     rec = {
         "rec_date": rec_date,
-        "symbol": best,
-        "name": str(binfo.get("name", "")),
+        "symbol": best["symbol"],
+        "name": best["name"],
         "entry_close": round(ref_price, 3),
         "limit_price": limit_price,
         "score": reason["score"],

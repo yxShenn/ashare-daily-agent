@@ -8,8 +8,36 @@ from .config import REPORT_DIR, ensure_dirs
 from . import store, portfolio, exits
 
 
+_PHASE_ZH = {"review": "开盘复盘", "select": "择时选股", "exit": "盘中离场"}
+_ACTION_ZH = {
+    "place_order": lambda a: f"挂买单 {a.get('name','')}({a['symbol']}) @ {a['limit_price']} —— {a.get('reason','')}",
+    "cancel_order": lambda a: f"撤单 {a['symbol']}",
+    "close": lambda a: f"平仓 {a['symbol']} @ {a.get('exit_price')} ({a.get('ret',0)*100:+.2f}%) —— {a.get('reason','')}",
+    "remember": lambda a: f"记忆:{a.get('note','')}",
+}
+
+
+def _append_agent_section(lines: list[str], agent) -> None:
+    """日报追加 Agent 决策摘要(决策文本 + 实际写操作)。无 agent 或未启用则跳过。"""
+    if agent is None or not getattr(agent, "available", False):
+        return
+    summaries = getattr(agent, "summaries", {}) or {}
+    actions = getattr(agent, "all_actions", []) or []
+    if not summaries and not actions:
+        return
+    lines.append("## 🤖 Agent 决策摘要(LLM 主导)\n")
+    for phase, text in summaries.items():
+        lines.append(f"**[{_PHASE_ZH.get(phase, phase)}]** {text}")
+    if actions:
+        lines.append("\n**本日 Agent 执行的操作:**")
+        for a in actions:
+            fmt = _ACTION_ZH.get(a.get("type"))
+            lines.append(f"- {fmt(a) if fmt else a}")
+    lines.append("")
+
+
 def build_report(cfg: dict, rec: dict | None, evals: list[dict],
-                 opt: dict, settle: dict | None, run_date: str) -> str:
+                 opt: dict, settle: dict | None, run_date: str, agent=None) -> str:
     s = store.stats()
     pf = portfolio.stats()
     lines: list[str] = []
@@ -40,6 +68,9 @@ def build_report(cfg: dict, rec: dict | None, evals: list[dict],
         fac = reason.get("factors", {})
         fac_str = ", ".join(f"{k}={v}" for k, v in fac.items())
         lines.append(f"- **因子值**:{fac_str}\n")
+
+    # 1.5 Agent 决策摘要(仅 LLM 主导模式;run_live 不传 agent 时跳过)
+    _append_agent_section(lines, agent)
 
     # 2. 历史推荐复盘
     lines.append("## 2. 今日完成复盘\n")

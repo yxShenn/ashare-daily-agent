@@ -5,9 +5,14 @@ venv/
 .idea/
 .vscode/
 
+# 密钥(LLM API key)绝不入库
+.env
+
 # 运行期产生的数据(缓存/台账/日报)不入库
 data/cache/
 data/reports/
 data/*.db
 data/active_config.json
 data/strategy_history.jsonl
+data/agent_trace/
+data/agent_memory.jsonl

@@ -105,3 +105,19 @@ live:
 hist:
   lookback_days: 400        # 拉取历史K线天数
   adjust: qfq               # 复权:qfq 前复权 / hfq 后复权 / "" 不复权
+
+# LLM 主导的 Agent 层(run_agent.py 用;run_live.py 不受影响)
+# 密钥从 .env 的 DEEPSEEK_API_KEY 读取,不写进本文件。
+agent:
+  enabled: true
+  provider: deepseek                       # 目前支持 deepseek(OpenAI 兼容接口)
+  model: deepseek-chat                     # 可被环境变量 DEEPSEEK_MODEL 覆盖
+  base_url: https://api.deepseek.com/v1    # 可被环境变量 DEEPSEEK_BASE_URL 覆盖
+  temperature: 0.3                         # 决策温度(偏低更稳健)
+  max_iters: 12                            # 单次决策的最大工具调用轮数(成本/防失控上限)
+  timeout_seconds: 120                     # 单次 LLM 调用超时
+  skills_dir: skills                       # 技能目录(相对项目根)
+  candidates_topn: 25                      # 喂给 LLM 的候选股数量上限
+  # 各决策点开关:关掉则回退到确定性引擎的对应逻辑
+  decide_select: true                      # 由 agent 决定选股+目标买入价
+  decide_exit: true                        # 由 agent 决定自由裁量出场(硬止损始终由代码强制)
