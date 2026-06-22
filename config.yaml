@@ -120,6 +120,13 @@ agent:
   timeout_seconds: 120
   skills_dir: skills
   candidates_topn: 25
-  trade_interval_minutes: 15               # 盘中自主决策间隔(分钟),开盘后立即首次执行
+  trade_interval_minutes: 10               # 无持仓时的自主决策间隔(分钟)
+  trade_interval_with_positions_minutes: 2 # 有持仓时的自主研判间隔(分钟),开盘后立即首次执行
+  # token 单价(元/百万):DeepSeek chat 响应只返回 token 数,不含金额;费用=下列单价×API usage 折算
+  token_pricing:
+    currency: CNY
+    input_per_million: 1.0                 # 输入(缓存未命中)
+    output_per_million: 2.0                # 输出
+    input_cache_hit_per_million: 0.1       # 输入(缓存命中)
   signal_eval_days: 999                    # 台账统计用,不触发机械卖出
   run_optimize: true                       # 启动时 walk-forward(仅为候选 score 参考)

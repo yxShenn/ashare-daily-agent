@@ -76,4 +76,36 @@ class LLMClient:
             resp = self._client.chat.completions.create(**kwargs)
         except Exception as e:  # 网络/鉴权/限流等统一归一为 LLMError,交由上层降级
             raise LLMError(f"LLM 调用失败: {e}") from e
-        return resp.choices[0].message
+        usage = self._parse_usage(resp)
+        return resp.choices[0].message, usage
+
+    @staticmethod
+    def _parse_usage(resp) -> dict:
+        """解析 DeepSeek/OpenAI 兼容 usage;优先 DeepSeek 官方 cache hit/miss 字段。"""
+        u = getattr(resp, "usage", None)
+        if u is None:
+            return {
+                "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                "cache_hit_tokens": 0, "cache_miss_tokens": 0, "cached_tokens": 0,
+            }
+        pt = int(getattr(u, "prompt_tokens", 0) or 0)
+        ct = int(getattr(u, "completion_tokens", 0) or 0)
+        hit = int(getattr(u, "prompt_cache_hit_tokens", 0) or 0)
+        miss = int(getattr(u, "prompt_cache_miss_tokens", 0) or 0)
+        if not hit and not miss:
+            details = getattr(u, "prompt_tokens_details", None)
+            hit = int(getattr(details, "cached_tokens", 0) or 0) if details else 0
+            miss = max(0, pt - hit)
+        reasoning = 0
+        ctd = getattr(u, "completion_tokens_details", None)
+        if ctd is not None:
+            reasoning = int(getattr(ctd, "reasoning_tokens", 0) or 0)
+        return {
+            "prompt_tokens": pt,
+            "completion_tokens": ct,
+            "total_tokens": int(getattr(u, "total_tokens", 0) or pt + ct),
+            "cache_hit_tokens": hit,
+            "cache_miss_tokens": miss,
+            "cached_tokens": hit,
+            "reasoning_tokens": reasoning,
+        }

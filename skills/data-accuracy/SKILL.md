@@ -60,6 +60,7 @@ description: 交易数据准确性纪律。任何涉及现价、涨跌幅、资�
 4. 限价在现价 × [0.8, 1.1] 内,且 ≤ 现价(买入)。
 5. 口头总结中的数字与工具 JSON **逐字段对应**,无四舍五入到错误量级。
 6. **止盈/止损/建仓**已同时参考大盘(`market_avg_pct`/`avg_pct`)与板块(`board_pct`,`board_vs_market_pct`,`decision_hint`),未仅凭大盘判断。
+7. **平仓日期**:以 `get_recent_trades.exit_date` / `closed_today` 为准;`exit_date` 等于会话日 → 写「今日」,禁止写「昨日」。
 
 违反以上任一条,宁可**不下单**,先重新调用 get_stock_detail / get_candidates 核对。
 

@@ -14,6 +14,7 @@ from .. import portfolio
 from . import memory, prompts
 from .llm import LLMClient, LLMError, available
 from .skills import SkillManager
+from .token_usage import day_summary, record as record_token_usage, save_session_start
 from .tools import ToolKit
 
 TRACE_DIR = DATA_DIR / "agent_trace"
@@ -31,7 +32,9 @@ def _tool_brief(name: str, result: dict) -> str:
         px = result.get("current_price")
         return f"ok, {result.get('symbol')} 现价 {px}"
     if name == "get_portfolio_state":
-        return f"ok, 权益 {result.get('equity')} 元, 持仓 {result.get('open_count')}"
+        n_closed = len(result.get("closed_today") or [])
+        extra = f", 今日已平 {n_closed} 笔" if n_closed else ""
+        return f"ok, 权益 {result.get('equity')} 元, 持仓 {result.get('open_count')}{extra}"
     if name == "get_market_overview":
         ao = result.get("as_of") or "?"
         return (f"ok, 涨 {result.get('up')}/跌 {result.get('down')} "
@@ -82,6 +85,10 @@ class TradingAgent:
         self.all_actions: list[dict] = []      # 全天累计的写操作(供日报)
         self.summaries: dict[str, str] = {}    # phase -> 决策总结文本
 
+    def usage_today(self, today: str) -> dict:
+        """当日 LLM token / 费用汇总。"""
+        return day_summary(today, self.cfg)
+
     def _client_or_none(self) -> LLMClient | None:
         if self._client is None:
             try:
@@ -97,14 +104,18 @@ class TradingAgent:
     def review(self, today: str) -> dict:
         mem = memory.recent(10)
         mem_txt = "\n".join(f"- {m['ts']}: {m['note']}" for m in mem) or "(暂无历史记忆)"
-        return self._run("review", today, prompts.REVIEW.format(today=today, memory=mem_txt))
+        now_hms = _dt.datetime.now().strftime("%H:%M:%S")
+        return self._run("review", today,
+                         prompts.REVIEW.format(today=today, now_hms=now_hms, memory=mem_txt))
 
     def trade(self, today: str, slots: int) -> dict:
         """自主交易:调研后决定买卖/挂撤单(无固定时刻与持有期)。"""
         opens = portfolio.get_positions("open")
         if slots <= 0 and not opens:
             return {"available": self.available, "skipped": "无持仓且无建仓名额", "actions": []}
-        return self._run("trade", today, prompts.TRADE.format(today=today, slots=slots))
+        now_hms = _dt.datetime.now().strftime("%H:%M:%S")
+        return self._run("trade", today,
+                         prompts.TRADE.format(today=today, now_hms=now_hms, slots=slots))
 
     def intraday_manage(self, today: str, slots: int) -> dict:
         return self.trade(today, slots)
@@ -120,7 +131,8 @@ class TradingAgent:
         symbol = str(symbol).strip()
         return self._run(
             "ask", today,
-            prompts.ASK.format(today=today, symbol=symbol, slots=slots),
+            prompts.ASK.format(today=today, now_hms=_dt.datetime.now().strftime("%H:%M:%S"),
+                               symbol=symbol, slots=slots),
             readonly=True,
         )
 
@@ -145,16 +157,22 @@ class TradingAgent:
                 print(f"  [{phase_zh}] 第 {i + 1}/{self.max_iters} 轮: "
                       f"正在请求 DeepSeek …", flush=True)
                 t_llm = time.perf_counter()
-                msg = client.chat(messages, tools=toolkit.schemas())
+                msg, usage = client.chat(messages, tools=toolkit.schemas())
                 llm_sec = time.perf_counter() - t_llm
+                day_u = record_token_usage(
+                    self.cfg, today, phase, client.model, usage, iter_n=i + 1,
+                )
+                u_hint = (f" +{usage['total_tokens']}tok(API) "
+                          f"(累计{day_u['total_tokens']}tok "
+                          f"折算{day_u['currency']}{day_u['cost']:.4f})")
                 if not getattr(msg, "tool_calls", None):
                     final_text = (msg.content or "").strip()
                     events.append({"assistant": final_text})
-                    print(f"  [{phase_zh}] DeepSeek 回复 ({llm_sec:.1f}s), 决策完成",
+                    print(f"  [{phase_zh}] DeepSeek 回复 ({llm_sec:.1f}s){u_hint}, 决策完成",
                           flush=True)
                     break
                 names = [tc.function.name for tc in msg.tool_calls]
-                print(f"  [{phase_zh}] DeepSeek 回复 ({llm_sec:.1f}s), "
+                print(f"  [{phase_zh}] DeepSeek 回复 ({llm_sec:.1f}s){u_hint}, "
                       f"执行工具: {', '.join(names)}", flush=True)
                 messages.append({
                     "role": "assistant",

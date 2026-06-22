@@ -100,7 +100,14 @@ class ToolKit:
                 "vs_board_pct": sc.get("vs_board_pct"),
                 "board_vs_market_pct": sc.get("board_vs_market_pct"),
             })
+        today_closed = [
+            {"symbol": t["symbol"], "name": t["name"], "shares": int(t["shares"]),
+             "exit_price": float(t["exit_price"]), "ret_pct": round(float(t["ret"]) * 100, 2)}
+            for t in portfolio.recent_trades(30)
+            if str(t.get("exit_date") or "") == self.today
+        ]
         return _ok(
+            session_date=self.today,
             cash=round(acct["cash"], 2),
             equity=round(eq, 2),
             initial_capital=round(acct["initial_capital"], 2),
@@ -113,6 +120,8 @@ class ToolKit:
             pending_orders=[{"symbol": p["symbol"], "name": p["name"],
                              "limit_price": p["limit_price"], "rec_date": p["rec_date"]}
                             for p in pendings],
+            closed_today=today_closed,
+            date_note="closed_today 为今日已平仓列表;总结中须写「今日平仓」而非「昨日」,除非 exit_date 确为前一交易日",
             price_note="positions.current_price 为新浪实时价,与成交 tick 同源",
             sector_note="止盈/止损须同时看大盘(avg_pct)与持仓 board_pct/board_vs_market_pct,不可只看大盘",
             market_avg_pct=market_avg,
@@ -229,8 +238,28 @@ class ToolKit:
             recent_closes=[round(float(c), 3) for c in closes[-10:]],
         )
 
+    def _enrich_trades(self, trades: list[dict]) -> list[dict]:
+        out = []
+        for t in trades:
+            exit_d = str(t.get("exit_date") or "")
+            is_today = exit_d == self.today
+            out.append({
+                **t,
+                "ret_pct": round(float(t["ret"]) * 100, 2),
+                "session_date": self.today,
+                "closed_today": is_today,
+                "date_wording": "今日" if is_today else exit_d,
+            })
+        return out
+
     def _t_get_recent_trades(self, limit: int = 10) -> dict:
-        return _ok(trades=portfolio.recent_trades(int(limit)))
+        trades = self._enrich_trades(portfolio.recent_trades(int(limit)))
+        return _ok(
+            session_date=self.today,
+            trades=trades,
+            note="总结表述: closed_today=true → 写「今日平仓/止盈」; closed_today=false → 写 exit_date 日期。"
+                 "禁止把今日平仓说成「昨日」(跨日记忆里的历史操作不等于昨日平仓)。",
+        )
 
     def _t_list_skills(self) -> dict:
         if not self.skills:
@@ -442,7 +471,7 @@ class ToolKit:
 _BASE_SCHEMAS: list[dict] = [
     {"type": "function", "function": {
         "name": "get_portfolio_state",
-        "description": "查看虚拟账户;持仓含行业板块涨跌(board_pct)与相对大盘强弱(board_vs_market_pct)。",
+        "description": "查看虚拟账户;含 closed_today(今日已平仓)与 session_date;持仓含板块涨跌。",
         "parameters": {"type": "object", "properties": {}},
     }},
     {"type": "function", "function": {
@@ -472,7 +501,7 @@ _BASE_SCHEMAS: list[dict] = [
     }},
     {"type": "function", "function": {
         "name": "get_recent_trades",
-        "description": "查看最近已平仓交易(用于复盘反思)。",
+        "description": "最近已平仓交易;含 exit_date/closed_today/date_wording,总结时须据此区分今日 vs 历史平仓。",
         "parameters": {"type": "object", "properties": {
             "limit": {"type": "integer", "description": "返回数量,默认10"}}},
     }},

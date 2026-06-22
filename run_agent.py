@@ -23,6 +23,7 @@ import time
 
 from ashare_agent import (config, paper_trade, portfolio, report, store, trade_log)
 from ashare_agent.brain.agent import TradingAgent
+from ashare_agent.brain.token_usage import save_session_start
 from run_live import (_hm, _position_symbols, brain_review, intraday_tick, market_open)
 
 _SYMBOL_RE = re.compile(r"\b(\d{6})\b")
@@ -31,6 +32,17 @@ _SYMBOL_RE = re.compile(r"\b(\d{6})\b")
 def _free_slots(cfg: dict) -> int:
     n = len(portfolio.get_positions("open")) + len(portfolio.get_positions("pending"))
     return max(0, int(cfg["account"]["max_positions"]) - n)
+
+
+def _trade_interval_minutes(cfg: dict) -> int:
+    """有持仓用更短间隔;无持仓用 trade_interval_minutes。"""
+    acfg = cfg.get("agent", {})
+    if portfolio.get_positions("open"):
+        return int(acfg.get("trade_interval_with_positions_minutes")
+                   or acfg.get("trade_interval_minutes")
+                   or acfg.get("manage_interval_minutes", 2))
+    return int(acfg.get("trade_interval_minutes")
+               or acfg.get("manage_interval_minutes", 10))
 
 
 def _parse_ask_symbol(line: str) -> str | None:
@@ -65,7 +77,20 @@ def _print_agent_actions(res: dict, prefix: str = "      ") -> None:
             print(f"{prefix}{icons[t]} 撤单 {a['symbol']}")
 
 
-def agent_review(agent: TradingAgent, today: str) -> None:
+def _print_token_day(agent: TradingAgent, today: str, cfg: dict) -> None:
+    u = agent.usage_today(today)
+    if u["calls"] == 0:
+        return
+    cur = u.get("currency", "CNY")
+    sym = "¥" if cur == "CNY" else f"{cur} "
+    line = (f"  [Token] API实测 {u['total_tokens']:,} tok ({u['calls']} 次) | "
+            f"折算 {sym}{u['cost']:.4f}")
+    if u.get("balance_spent") is not None:
+        line += f" | 余额扣费 {sym}{u['balance_spent']:.4f} (余 {sym}{u['current_balance']:.2f})"
+    print(line, flush=True)
+
+
+def agent_review(agent: TradingAgent, cfg: dict, today: str) -> None:
     if not agent.available:
         return
     print("[Agent] 开盘复盘 ...")
@@ -74,6 +99,7 @@ def agent_review(agent: TradingAgent, today: str) -> None:
     _print_agent_actions(res)
     if res.get("summary"):
         print(f"      {res['summary']}")
+    _print_token_day(agent, today, cfg)
 
 
 def agent_trade(agent: TradingAgent, cfg: dict, today: str) -> None:
@@ -93,6 +119,7 @@ def agent_trade(agent: TradingAgent, cfg: dict, today: str) -> None:
             print(f"  {res['summary']}")
     elif res.get("skipped"):
         print(f"  (跳过:{res['skipped']})")
+    _print_token_day(agent, today, cfg)
 
 
 def agent_ask(agent: TradingAgent, cfg: dict, today: str, symbol: str) -> None:
@@ -114,6 +141,7 @@ def agent_ask(agent: TradingAgent, cfg: dict, today: str, symbol: str) -> None:
         print("─" * 50 + "\n")
     elif res.get("error"):
         print(f"  询价失败: {res['error']}")
+    _print_token_day(agent, today, cfg)
 
 
 def _input_listener(q: queue.Queue) -> None:
@@ -162,6 +190,7 @@ def run_eod(agent: TradingAgent, cfg: dict, today: str, evals: list,
           + (" (熔断)" if settle["halted"] else ""))
     n = len(trade_log.load_all())
     print(f"  成交台账 {n} 笔 → {trade_log.TRADE_LOG_PATH}")
+    _print_token_day(agent, today, cfg)
 
     text = report.build_report(cfg, None, evals, opt, settle, today, agent=agent)
     print("\n" + "=" * 60)
@@ -189,8 +218,9 @@ def main() -> None:
     acfg = cfg.get("agent", {})
     interval = int(cfg["live"]["interval_seconds"])
     close_time = cfg["live"]["afternoon"][1]
-    trade_mins = int(acfg.get("trade_interval_minutes")
-                     or acfg.get("manage_interval_minutes", 15))
+    pos_mins = int(acfg.get("trade_interval_with_positions_minutes", 2))
+    idle_mins = int(acfg.get("trade_interval_minutes")
+                    or acfg.get("manage_interval_minutes", 10))
 
     evals, opt = [], {}
     if acfg.get("run_optimize", True) and not args.no_optimize and not args.ask:
@@ -203,16 +233,24 @@ def main() -> None:
         print("[Agent] 未启用或无 DEEPSEEK_API_KEY,无法自主交易(参考 .env.example)。")
         return
 
+    bal = save_session_start(cfg, today)
+    if bal:
+        sym = "¥" if bal.get("currency") == "CNY" else f"{bal.get('currency')} "
+        print(f"[DeepSeek] 账户余额 {sym}{bal['total_balance']:.2f} "
+              f"(赠金 {sym}{bal['granted_balance']:.2f})", flush=True)
+
     if args.ask:
         agent_ask(agent, cfg, today, args.ask.strip())
+        _print_token_day(agent, today, cfg)
         return
 
-    agent_review(agent, today)
+    agent_review(agent, cfg, today)
     last_trade: _dt.datetime | None = None
 
     if args.once:
         agent_trade(agent, cfg, today)
         intraday_tick(cfg, today)
+        _print_token_day(agent, today, cfg)
         return
     if args.eod_now:
         agent_trade(agent, cfg, today)
@@ -222,7 +260,8 @@ def main() -> None:
     ask_q: queue.Queue[str] = queue.Queue()
     threading.Thread(target=_input_listener, args=(ask_q,), daemon=True).start()
 
-    print(f"\n盘中循环 | tick {interval}s | Agent 自主交易每 {trade_mins}min | "
+    print(f"\n盘中循环 | tick {interval}s | Agent 自主交易 "
+          f"有持仓每 {pos_mins}min / 无持仓每 {idle_mins}min | "
           f"收盘 {close_time} 后结算")
     print("  盘中询价: 输入 ask 601958 或 601958 + 回车 (仅分析,不自动下单)")
     eod_done = False
@@ -234,6 +273,7 @@ def main() -> None:
             eod_done = True
         elif market_open(now, cfg):
             _drain_ask_queue(ask_q, agent, cfg, today)
+            trade_mins = _trade_interval_minutes(cfg)
             due = (last_trade is None
                    or (now - last_trade).total_seconds() >= trade_mins * 60)
             if due:
