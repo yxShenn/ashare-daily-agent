@@ -9,21 +9,37 @@ run_live.py 仍为确定性模式,互不影响。
     python run_agent.py --once           # 复盘 + 一次自主交易 + tick(调试,不限交易时段)
     python run_agent.py --eod-now        # 复盘 + 自主交易 + 收盘结算+日报(调试)
     python run_agent.py --once --no-optimize   # 跳过 walk-forward,非开盘快速冒烟
+    python run_agent.py --ask 601958     # 询价单只股票是否值得建仓(只分析不下单)
+    盘中运行时可输入: ask 601958  或  601958  + 回车
 """
 from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import queue
+import re
+import threading
 import time
 
 from ashare_agent import (config, paper_trade, portfolio, report, store, trade_log)
 from ashare_agent.brain.agent import TradingAgent
 from run_live import (_hm, _position_symbols, brain_review, intraday_tick, market_open)
 
+_SYMBOL_RE = re.compile(r"\b(\d{6})\b")
+
 
 def _free_slots(cfg: dict) -> int:
     n = len(portfolio.get_positions("open")) + len(portfolio.get_positions("pending"))
     return max(0, int(cfg["account"]["max_positions"]) - n)
+
+
+def _parse_ask_symbol(line: str) -> str | None:
+    """从用户输入解析 6 位股票代码。"""
+    line = line.strip()
+    if not line or line.lower() in ("help", "?", "h", "帮助"):
+        return None
+    m = _SYMBOL_RE.search(line)
+    return m.group(1) if m else None
 
 
 def _print_agent_actions(res: dict, prefix: str = "      ") -> None:
@@ -79,6 +95,50 @@ def agent_trade(agent: TradingAgent, cfg: dict, today: str) -> None:
         print(f"  (跳过:{res['skipped']})")
 
 
+def agent_ask(agent: TradingAgent, cfg: dict, today: str, symbol: str) -> None:
+    """盘中询价:分析是否值得建仓(只读,不自动下单)。"""
+    if not agent.available:
+        print("[Agent] 未启用,无法询价。")
+        return
+    symbol = str(symbol).strip()
+    if not _SYMBOL_RE.fullmatch(symbol):
+        print(f"[询价] 代码格式错误:{symbol}(须为6位数字)")
+        return
+    slots = _free_slots(cfg)
+    print(f"\n[询价] {symbol} 是否值得建仓?(可用名额 {slots}, 仅分析不下单)")
+    print("  (调用 DeepSeek + 工具调研,通常需 1~2 分钟,请稍候)", flush=True)
+    res = agent.ask(today, symbol, slots)
+    if res.get("summary"):
+        print("\n" + "─" * 50)
+        print(res["summary"])
+        print("─" * 50 + "\n")
+    elif res.get("error"):
+        print(f"  询价失败: {res['error']}")
+
+
+def _input_listener(q: queue.Queue) -> None:
+    """后台线程:读取用户 stdin,供盘中询价。"""
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        q.put(line)
+
+
+def _drain_ask_queue(q: queue.Queue, agent: TradingAgent, cfg: dict, today: str) -> None:
+    while True:
+        try:
+            line = q.get_nowait()
+        except queue.Empty:
+            break
+        sym = _parse_ask_symbol(line)
+        if sym:
+            agent_ask(agent, cfg, today, sym)
+        elif line.strip():
+            print("  [询价] 未识别代码。输入 ask 601958 或直接输入 6 位代码; help 查看帮助")
+
+
 def run_eod(agent: TradingAgent, cfg: dict, today: str, evals: list,
             opt: dict) -> None:
     print("\n[收盘结算] 权益快照 ...")
@@ -114,7 +174,12 @@ def main() -> None:
     parser.add_argument("--eod-now", action="store_true", help="复盘+自主交易+立即收盘+日报")
     parser.add_argument("--no-optimize", action="store_true",
                         help="跳过 walk-forward 优化(非开盘快速测试用)")
+    parser.add_argument("--ask", metavar="SYMBOL",
+                        help="询价单只股票是否值得建仓(只分析不下单,完成后退出)")
     args = parser.parse_args()
+
+    if args.ask and not _SYMBOL_RE.fullmatch(args.ask.strip()):
+        parser.error("--ask 须为 6 位 A 股代码,如 601958")
 
     config.ensure_dirs()
     store.init_db()
@@ -128,14 +193,18 @@ def main() -> None:
                      or acfg.get("manage_interval_minutes", 15))
 
     evals, opt = [], {}
-    if acfg.get("run_optimize", True) and not args.no_optimize:
+    if acfg.get("run_optimize", True) and not args.no_optimize and not args.ask:
         cfg, evals, opt = brain_review(cfg)
-    else:
+    elif not args.no_optimize:
         print("[大脑] 跳过 walk-forward 优化(快速测试模式)")
 
     agent = TradingAgent(cfg)
     if not agent.available:
         print("[Agent] 未启用或无 DEEPSEEK_API_KEY,无法自主交易(参考 .env.example)。")
+        return
+
+    if args.ask:
+        agent_ask(agent, cfg, today, args.ask.strip())
         return
 
     agent_review(agent, today)
@@ -150,8 +219,12 @@ def main() -> None:
         run_eod(agent, cfg, today, evals, opt)
         return
 
+    ask_q: queue.Queue[str] = queue.Queue()
+    threading.Thread(target=_input_listener, args=(ask_q,), daemon=True).start()
+
     print(f"\n盘中循环 | tick {interval}s | Agent 自主交易每 {trade_mins}min | "
           f"收盘 {close_time} 后结算")
+    print("  盘中询价: 输入 ask 601958 或 601958 + 回车 (仅分析,不自动下单)")
     eod_done = False
     while not eod_done:
         now = _dt.datetime.now()
@@ -160,14 +233,17 @@ def main() -> None:
             run_eod(agent, cfg, today, evals, opt)
             eod_done = True
         elif market_open(now, cfg):
+            _drain_ask_queue(ask_q, agent, cfg, today)
             due = (last_trade is None
                    or (now - last_trade).total_seconds() >= trade_mins * 60)
             if due:
                 agent_trade(agent, cfg, today)
                 last_trade = now
             intraday_tick(cfg, today)
+            _drain_ask_queue(ask_q, agent, cfg, today)
             time.sleep(interval)
         else:
+            _drain_ask_queue(ask_q, agent, cfg, today)
             print(f"  {_hm(now)} 非交易时段,等待 ...")
             time.sleep(30)
 

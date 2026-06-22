@@ -23,25 +23,38 @@ def _ok(**kw) -> dict:
     return {"ok": True, **kw}
 
 
+_WRITE_TOOLS = frozenset({
+    "place_limit_order", "cancel_order", "close_position",
+    "reduce_position", "add_to_position", "remember",
+})
+
+
 class ToolKit:
     """一次决策周期内复用。持有 cfg/today/skills,并记录已执行的写操作(供日报)。"""
 
-    def __init__(self, cfg: dict, today: str, skills):
+    def __init__(self, cfg: dict, today: str, skills, readonly: bool = False):
         self.cfg = cfg
         self.today = today
         self.skills = skills
+        self.readonly = readonly
         self.actions: list[dict] = []          # 本次决策实际发生的写操作
         self._price_cache: dict[str, float] = {}
+        self._mkt_cache: dict | None = None    # 本周期大盘广度(避免重复拉全市场)
 
     # ---------------- 工具 schema(OpenAI function calling 格式) ----------------
 
     def schemas(self) -> list[dict]:
         skill_tools = self.skills.tool_schemas() if self.skills else []
-        return _BASE_SCHEMAS + skill_tools
+        base = _BASE_SCHEMAS
+        if self.readonly:
+            base = [s for s in base if s["function"]["name"] not in _WRITE_TOOLS]
+        return base + skill_tools
 
     # ---------------- 调用分发 ----------------
 
     def call(self, name: str, args: dict) -> dict:
+        if self.readonly and name in _WRITE_TOOLS:
+            return _err("询价模式仅分析不下单;如需自动挂单请等待自主交易轮次")
         fn = getattr(self, f"_t_{name}", None)
         if fn is None:
             # 交给技能注册的工具
@@ -66,7 +79,7 @@ class ToolKit:
         px = self._quotes([p["symbol"] for p in opens])
         eq = portfolio.equity(px)
         acct = portfolio.get_account()
-        mkt = self._t_get_market_overview()
+        mkt = self._market_overview()
         market_avg = mkt.get("avg_pct") if mkt.get("ok") else None
         positions = []
         for p in opens:
@@ -105,26 +118,27 @@ class ToolKit:
             market_avg_pct=market_avg,
         )
 
+    def _market_overview(self) -> dict:
+        """本决策周期内复用的大盘广度(实时新浪快照)。"""
+        if self._mkt_cache is None:
+            self._mkt_cache = self._t_get_market_overview()
+        return self._mkt_cache
+
     def _t_get_market_overview(self) -> dict:
-        spot = data.get_spot()
-        df = spot[spot["exchange"] != "bj"]
-        pct = df["pct"].dropna()
-        up = int((pct > 0).sum())
-        down = int((pct < 0).sum())
-        limit_up = int((pct >= 9.8).sum())
+        spot = data.get_live_spot()
+        br = data.market_breadth(spot)
+        meta = data.live_spot_meta()
         return _ok(
-            total=int(len(pct)), up=up, down=down, flat=int(len(pct) - up - down),
-            limit_up_approx=limit_up,
-            avg_pct=round(float(pct.mean()), 2) if len(pct) else None,
-            median_pct=round(float(pct.median()), 2) if len(pct) else None,
-            total_amount_yi=round(float(df["amount"].sum()) / 1e8, 1),
-            note="广度统计基于全市场 spot 快照(非逐股实时);个股现价请用 get_stock_detail/current_price;"
-                 "卖出/买入决策须结合 get_sector_context 看所属板块,不可仅凭大盘涨跌",
+            **br,
+            as_of=meta.get("as_of"),
+            data_source=meta.get("source", "sina_live"),
+            note="涨跌家数为新浪全市场实时快照(盘中会刷新);个股现价请用 current_price;"
+                 "决策须结合 get_sector_context 看板块",
         )
 
     def _t_get_sector_context(self, symbol: str) -> dict:
         symbol = str(symbol).strip()
-        mkt = self._t_get_market_overview()
+        mkt = self._market_overview()
         market_avg = mkt.get("avg_pct") if mkt.get("ok") else None
         sc = data.get_sector_context(symbol, market_avg)
         legend = data.agent_field_legend(self.cfg)
@@ -191,7 +205,7 @@ class ToolKit:
             spot = data.get_spot().set_index("symbol")
             if symbol in spot.index:
                 name = str(spot.loc[symbol].get("name", ""))
-        mkt = self._t_get_market_overview()
+        mkt = self._market_overview()
         market_avg = mkt.get("avg_pct") if mkt.get("ok") else None
         sector = data.get_sector_context(symbol, market_avg)
         return _ok(
@@ -433,7 +447,7 @@ _BASE_SCHEMAS: list[dict] = [
     }},
     {"type": "function", "function": {
         "name": "get_market_overview",
-        "description": "全市场情绪概览(涨跌家数/均涨跌幅/成交额;广度统计,非逐股实时价)。",
+        "description": "全市场实时广度:涨跌家数/均涨跌幅(新浪实时快照,盘中刷新);含 as_of 时间戳。",
         "parameters": {"type": "object", "properties": {}},
     }},
     {"type": "function", "function": {

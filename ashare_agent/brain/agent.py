@@ -17,7 +17,7 @@ from .skills import SkillManager
 from .tools import ToolKit
 
 TRACE_DIR = DATA_DIR / "agent_trace"
-_PHASE_ZH = {"review": "开盘复盘", "trade": "自主交易"}
+_PHASE_ZH = {"review": "开盘复盘", "trade": "自主交易", "ask": "盘中询价"}
 
 
 def _tool_brief(name: str, result: dict) -> str:
@@ -33,7 +33,9 @@ def _tool_brief(name: str, result: dict) -> str:
     if name == "get_portfolio_state":
         return f"ok, 权益 {result.get('equity')} 元, 持仓 {result.get('open_count')}"
     if name == "get_market_overview":
-        return f"ok, 涨 {result.get('up')}/跌 {result.get('down')} 均{result.get('avg_pct')}%"
+        ao = result.get("as_of") or "?"
+        return (f"ok, 涨 {result.get('up')}/跌 {result.get('down')} "
+                f"均{result.get('avg_pct')}% @{ao}")
     if name == "get_sector_context":
         return (f"ok, {result.get('board_name')} {result.get('board_pct')}% "
                 f"vs大盘{result.get('board_vs_market_pct')}")
@@ -113,14 +115,24 @@ class TradingAgent:
     def intraday_exit(self, today: str) -> dict:
         return self.trade(today, 0)
 
+    def ask(self, today: str, symbol: str, slots: int) -> dict:
+        """盘中询价:分析单只股票是否值得建仓(只读,不下单)。"""
+        symbol = str(symbol).strip()
+        return self._run(
+            "ask", today,
+            prompts.ASK.format(today=today, symbol=symbol, slots=slots),
+            readonly=True,
+        )
+
     # ---------------- ReAct 主循环 ----------------
 
-    def _run(self, phase: str, today: str, user_prompt: str) -> dict:
+    def _run(self, phase: str, today: str, user_prompt: str,
+             readonly: bool = False) -> dict:
         client = self._client_or_none()
         if client is None:
             return {"available": False, "actions": []}
 
-        toolkit = ToolKit(self.cfg, today, self.skills)
+        toolkit = ToolKit(self.cfg, today, self.skills, readonly=readonly)
         phase_zh = _PHASE_ZH.get(phase, phase)
         messages = [
             {"role": "system", "content": _system_prompt(self.skills)},
@@ -183,7 +195,8 @@ class TradingAgent:
             return {"available": False, "actions": toolkit.actions, "error": str(e)}
 
         self._trace(today, events)
-        self.all_actions.extend(toolkit.actions)
+        if not readonly:
+            self.all_actions.extend(toolkit.actions)
         if final_text:
             self.summaries[phase] = final_text
         return {"available": True, "actions": toolkit.actions, "summary": final_text}

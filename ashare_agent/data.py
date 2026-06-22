@@ -15,6 +15,8 @@ import pandas as pd
 from .config import CACHE_DIR, ensure_dirs
 
 _MEM: dict[str, pd.DataFrame] = {}
+_LIVE_SPOT: dict = {}  # {"df": DataFrame, "ts": float(epoch)}
+
 
 # 新浪全市场快照列(代码形如 sh600519 / sz000001 / bj920000)
 _SINA_RENAME = {
@@ -56,6 +58,76 @@ def get_spot() -> pd.DataFrame:
         df.to_pickle(path)
     _MEM[key] = df
     return df
+
+
+def get_live_spot(max_age_seconds: int = 45) -> pd.DataFrame:
+    """全市场实时快照(新浪 stock_zh_a_spot),短 TTL 内存缓存。
+
+    与 get_spot() 的「当日磁盘缓存、盘中不刷新」不同;供 Agent 大盘广度统计。
+    拉取失败时回退 get_spot() 并尽量标注为陈旧数据。
+    """
+    import time
+
+    now = time.time()
+    cached = _LIVE_SPOT.get("df")
+    if cached is not None and now - float(_LIVE_SPOT.get("ts", 0)) < max_age_seconds:
+        return cached
+
+    try:
+        import akshare as ak
+
+        raw = ak.stock_zh_a_spot()
+        df = raw.rename(columns=_SINA_RENAME)
+        df["exchange"] = df["symbol_raw"].str[:2]
+        df["symbol"] = df["symbol_raw"].str[2:]
+        for c in ("close", "pct", "amount", "volume", "open", "prev_close",
+                  "high", "low"):
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        _LIVE_SPOT["df"] = df
+        _LIVE_SPOT["ts"] = now
+        _LIVE_SPOT["source"] = "sina_live"
+        return df
+    except Exception:
+        if cached is not None:
+            return cached
+        df = get_spot().copy()
+        _LIVE_SPOT["df"] = df
+        _LIVE_SPOT["ts"] = now
+        _LIVE_SPOT["source"] = "spot_disk_fallback"
+        return df
+
+
+def market_breadth(df: pd.DataFrame | None = None) -> dict:
+    """从全市场快照计算涨跌家数/均涨跌幅等广度指标。"""
+    spot = df if df is not None else get_live_spot()
+    board = spot[spot["exchange"] != "bj"]
+    pct = board["pct"].dropna()
+    up = int((pct > 0).sum())
+    down = int((pct < 0).sum())
+    total = int(len(pct))
+    return {
+        "total": total,
+        "up": up,
+        "down": down,
+        "flat": int(total - up - down),
+        "limit_up_approx": int((pct >= 9.8).sum()),
+        "avg_pct": round(float(pct.mean()), 2) if len(pct) else None,
+        "median_pct": round(float(pct.median()), 2) if len(pct) else None,
+        "total_amount_yi": round(float(board["amount"].sum()) / 1e8, 1)
+        if "amount" in board.columns else None,
+    }
+
+
+def live_spot_meta() -> dict:
+    """最近一次 live spot 的元信息(source/as_of)。"""
+    import datetime as dt
+
+    ts = _LIVE_SPOT.get("ts")
+    as_of = None
+    if ts:
+        as_of = dt.datetime.fromtimestamp(float(ts)).strftime("%H:%M:%S")
+    return {"source": _LIVE_SPOT.get("source", "unknown"), "as_of": as_of}
 
 
 def _sina_prefix(symbol: str) -> str | None:
@@ -187,6 +259,8 @@ def agent_field_legend(cfg: dict | None = None) -> dict:
         ),
         "fund_flow_recent": "逐日主力净流入:main_net_yi=亿元,main_ratio_pct=占成交额%",
         "price_source": "sina_realtime=实时接口;spot_fallback=实时不可用时的快照兜底",
+        "up_down": "get_market_overview 涨跌家数,新浪全市场实时快照,字段 as_of 为抓取时刻",
+        "avg_pct": "全市场均涨跌幅(%),来自 get_market_overview 实时快照",
         "board_pct": "所属东财行业板块当日涨跌幅(%)",
         "vs_board_pct": "个股涨跌幅减板块涨跌幅(百分点),正=强于板块",
         "board_vs_market_pct": "板块涨跌幅减全市场均涨跌幅(百分点),正=板块强于大盘",

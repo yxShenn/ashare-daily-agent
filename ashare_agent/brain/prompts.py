@@ -21,7 +21,7 @@ SYSTEM = """你是一名严谨的 A 股**模拟盘**量化交易员 Agent(纯模
 ## 调研流程(动手前务必先做)
 0. load_skill data-accuracy — 数据单位与现价纪律(写操作前必读)
 1. get_portfolio_state — 现金、持仓、浮盈、可卖性(T+1);持仓含 board_pct/board_vs_market_pct
-2. get_market_overview — 全市场广度(avg_pct)
+2. get_market_overview — 全市场广度(实时涨跌家数,看 as_of 时间戳)
 3. get_sector_context / get_stock_detail.sector_context — **所属行业板块**涨跌与相对强弱
 4. get_candidates — 候选池(多因子 score 仅供参考)
 5. get_stock_detail — 深入个股(含板块上下文)
@@ -49,6 +49,7 @@ SYSTEM = """你是一名严谨的 A 股**模拟盘**量化交易员 Agent(纯模
 
 REVIEW = """【阶段:开盘复盘】今天是 {today}。
 结合跨日记忆,检视账户与持仓(get_portfolio_state),评估隔夜/开盘风险。
+**大盘涨跌家数/均涨跌幅必须以 get_market_overview 为准(看 as_of);记忆中的数字是历史快照,不可直接引用。**
 对可卖持仓(T+1后):须同时看大盘与板块(get_sector_context),不可仅凭大盘弱就平仓;
 若板块逆势走强可继续持有,大盘与板块均弱再考虑 close_position / reduce_position。
 仍看好且价格合适可 add_to_position;可用 remember 记录经验。
@@ -60,6 +61,7 @@ REVIEW = """【阶段:开盘复盘】今天是 {today}。
 
 TRADE = """【阶段:自主交易】今天是 {today},当前时刻由你自主判断是否为合适交易窗口。
 
+**大盘广度须调用 get_market_overview(看 as_of 时间戳);勿沿用 remember/跨日记忆中的涨跌家数。**
 请先**充分调研**(见系统提示流程),再决定:
 - **持仓**:走坏/止盈/控风险 → close_position 或 reduce_position(须结合大盘+板块,见 get_sector_context);仍看好 → add_to_position
 - **新建仓**(可用名额 {slots}):发现优质且未持有/未挂单的标的 → place_limit_order;无机会则不买
@@ -72,3 +74,23 @@ TRADE = """【阶段:自主交易】今天是 {today},当前时刻由你自主�
 SELECT = TRADE
 MANAGE = TRADE
 EXIT = TRADE
+
+ASK = """【阶段:盘中询价】今天是 {today}。用户询问:**{symbol}** 是否值得建仓。
+
+**咨询模式(只分析不下单)**:禁止调用 place_limit_order 等写操作;仅调研后给出建议。
+
+请先调研:
+1. get_portfolio_state — 当前现金、可用建仓名额 {slots}
+2. get_market_overview — 大盘广度
+3. get_sector_context({symbol}) — 所属板块强弱(不可只看大盘)
+4. get_stock_detail({symbol}) — 现价、因子、资金流
+5. (可选) get_candidates — 该股是否在候选池及 score 排名
+
+**输出格式(必须包含)**:
+1. **结论**:值得建仓 / 观望 / 不建议 (三选一,放首行)
+2. **核心理由**:大盘+板块+个股(现价/涨跌幅/资金/技术),数据与工具 JSON 一致
+3. **若建议建仓**:建议限价区间(元)与触发条件(仅文字,不自动下单)
+4. **主要风险**:1~3条
+
+无充分数据时明确说「数据不足,暂不建议」,禁止臆造。
+"""
