@@ -20,6 +20,7 @@ import time
 
 from ashare_agent import (config, evaluate, optimize, paper_trade,
                           portfolio, recommend, report, store, trade_log)
+from ashare_agent.tick_display import print_intraday_status
 
 
 def _hm(now: _dt.datetime) -> str:
@@ -88,27 +89,18 @@ def intraday_tick(cfg: dict, today: str) -> None:
         return
 
     quotes = paper_trade.build_live_quotes(syms, cfg)
-    print(f"  {ts} 行情获取 {len(quotes)}/{len(syms)} 只 | 持仓{len(opens)} 限价挂单{len(pendings)}")
 
     entered, skipped = paper_trade.enter_pending(
         cfg, {s: q["price"] for s, q in quotes.items()}, today, same_day=True)
     closed = paper_trade.check_exits(cfg, quotes, today, is_eod=False)
     eq = portfolio.equity({s: q["price"] for s, q in quotes.items()})
+    opens = portfolio.get_positions("open")
+    pendings = portfolio.get_positions("pending")
 
-    for e in entered:
-        print(f"  🟢 建仓 {e['name']}({e['symbol']}) {e['shares']}股 @ {e['price']}")
-    for sk in skipped:
-        print(f"  ⏭️  跳过 {sk['name']}({sk['symbol']}):{sk['reason']}")
-    for c in closed:
-        print(f"  🔴 平仓 {c['name']}({c['symbol']}) @ {c['exit_price']} [{c['reason']}] "
-              f"{c['ret']*100:.2f}%")
-    if opens:
-        for p in opens:
-            q = quotes.get(p["symbol"])
-            if q:
-                pr = q["price"] / float(p["entry_price"]) - 1
-                print(f"     持有 {p['name']}({p['symbol']}) 现价{q['price']} 浮盈{pr*100:+.2f}%")
-    print(f"  {ts} 持仓{len(portfolio.get_positions('open'))}笔 权益≈{eq:.0f}")
+    print_intraday_status(
+        ts, opens, pendings, quotes, skipped, eq,
+        entered=entered, closed=closed,
+    )
 
 
 def run_eod(cfg: dict, today: str, evals: list, opt: dict, rec: dict | None) -> None:

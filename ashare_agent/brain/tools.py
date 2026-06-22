@@ -66,10 +66,13 @@ class ToolKit:
         px = self._quotes([p["symbol"] for p in opens])
         eq = portfolio.equity(px)
         acct = portfolio.get_account()
+        mkt = self._t_get_market_overview()
+        market_avg = mkt.get("avg_pct") if mkt.get("ok") else None
         positions = []
         for p in opens:
             cur = px.get(p["symbol"])
             fp = (cur / float(p["entry_price"]) - 1) if cur and p["entry_price"] else None
+            sc = data.get_sector_context(p["symbol"], market_avg)
             positions.append({
                 "symbol": p["symbol"], "name": p["name"], "shares": int(p["shares"]),
                 "entry_price": float(p["entry_price"]), "entry_date": p["entry_date"],
@@ -77,6 +80,12 @@ class ToolKit:
                 "current_price": cur,
                 "float_return_pct": None if fp is None else round(fp * 100, 2),
                 "sellable_today": p["entry_date"] < self.today,   # T+1
+                "industry": sc.get("industry"),
+                "board_name": sc.get("board_name"),
+                "board_pct": sc.get("board_pct"),
+                "stock_pct": sc.get("stock_pct"),
+                "vs_board_pct": sc.get("vs_board_pct"),
+                "board_vs_market_pct": sc.get("board_vs_market_pct"),
             })
         return _ok(
             cash=round(acct["cash"], 2),
@@ -92,6 +101,8 @@ class ToolKit:
                              "limit_price": p["limit_price"], "rec_date": p["rec_date"]}
                             for p in pendings],
             price_note="positions.current_price 为新浪实时价,与成交 tick 同源",
+            sector_note="止盈/止损须同时看大盘(avg_pct)与持仓 board_pct/board_vs_market_pct,不可只看大盘",
+            market_avg_pct=market_avg,
         )
 
     def _t_get_market_overview(self) -> dict:
@@ -107,7 +118,22 @@ class ToolKit:
             avg_pct=round(float(pct.mean()), 2) if len(pct) else None,
             median_pct=round(float(pct.median()), 2) if len(pct) else None,
             total_amount_yi=round(float(df["amount"].sum()) / 1e8, 1),
-            note="广度统计基于全市场 spot 快照(非逐股实时);个股现价请用 get_stock_detail/current_price",
+            note="广度统计基于全市场 spot 快照(非逐股实时);个股现价请用 get_stock_detail/current_price;"
+                 "卖出/买入决策须结合 get_sector_context 看所属板块,不可仅凭大盘涨跌",
+        )
+
+    def _t_get_sector_context(self, symbol: str) -> dict:
+        symbol = str(symbol).strip()
+        mkt = self._t_get_market_overview()
+        market_avg = mkt.get("avg_pct") if mkt.get("ok") else None
+        sc = data.get_sector_context(symbol, market_avg)
+        legend = data.agent_field_legend(self.cfg)
+        return _ok(
+            **sc,
+            market_avg_pct=market_avg,
+            field_legend={k: legend[k] for k in (
+                "board_pct", "vs_board_pct", "board_vs_market_pct", "pct")},
+            note="大盘弱但 board_vs_market_pct>0 表示板块逆势走强,不宜仅凭大盘弱就卖出",
         )
 
     def _t_get_candidates(self, topn: int | None = None) -> dict:
@@ -165,6 +191,9 @@ class ToolKit:
             spot = data.get_spot().set_index("symbol")
             if symbol in spot.index:
                 name = str(spot.loc[symbol].get("name", ""))
+        mkt = self._t_get_market_overview()
+        market_avg = mkt.get("avg_pct") if mkt.get("ok") else None
+        sector = data.get_sector_context(symbol, market_avg)
         return _ok(
             symbol=symbol, name=name,
             current_price=round(float(current), 3) if current else None,
@@ -181,6 +210,7 @@ class ToolKit:
                 if mf_avg is not None else None
             ),
             fund_flow_recent=data.fund_flow_recent(symbol, mf_days),
+            sector_context=sector,
             field_legend=data.agent_field_legend(self.cfg),
             recent_closes=[round(float(c), 3) for c in closes[-10:]],
         )
@@ -398,7 +428,7 @@ class ToolKit:
 _BASE_SCHEMAS: list[dict] = [
     {"type": "function", "function": {
         "name": "get_portfolio_state",
-        "description": "查看虚拟账户:现金、总权益、回撤、持仓(current_price=新浪实时价,与成交 tick 同源)、挂单。",
+        "description": "查看虚拟账户;持仓含行业板块涨跌(board_pct)与相对大盘强弱(board_vs_market_pct)。",
         "parameters": {"type": "object", "properties": {}},
     }},
     {"type": "function", "function": {
@@ -413,8 +443,15 @@ _BASE_SCHEMAS: list[dict] = [
             "topn": {"type": "integer", "description": "返回数量上限,默认取配置 candidates_topn"}}},
     }},
     {"type": "function", "function": {
+        "name": "get_sector_context",
+        "description": "个股所属行业板块涨跌、板块内涨跌家数、个股相对板块/大盘强弱;止盈止损须与大盘一并参考。",
+        "parameters": {"type": "object", "properties": {
+            "symbol": {"type": "string", "description": "6位A股代码"}},
+            "required": ["symbol"]},
+    }},
+    {"type": "function", "function": {
         "name": "get_stock_detail",
-        "description": "个股详情:current_price(实时现价)、last_daily_close(日K,非现价)、fund_flow_recent(金额亿/占比%)、因子与均线。",
+        "description": "个股详情:现价、板块(sector_context)、资金流、因子与均线;卖出决策须看板块不单看大盘。",
         "parameters": {"type": "object", "properties": {
             "symbol": {"type": "string", "description": "6位A股代码,如 600519"}},
             "required": ["symbol"]},

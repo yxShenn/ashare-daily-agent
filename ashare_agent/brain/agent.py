@@ -33,7 +33,10 @@ def _tool_brief(name: str, result: dict) -> str:
     if name == "get_portfolio_state":
         return f"ok, 权益 {result.get('equity')} 元, 持仓 {result.get('open_count')}"
     if name == "get_market_overview":
-        return f"ok, 涨 {result.get('up')}/跌 {result.get('down')}"
+        return f"ok, 涨 {result.get('up')}/跌 {result.get('down')} 均{result.get('avg_pct')}%"
+    if name == "get_sector_context":
+        return (f"ok, {result.get('board_name')} {result.get('board_pct')}% "
+                f"vs大盘{result.get('board_vs_market_pct')}")
     if name == "load_skill":
         return f"ok, 已载入 {result.get('name')}"
     if name == "list_skills":

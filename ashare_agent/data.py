@@ -187,7 +187,120 @@ def agent_field_legend(cfg: dict | None = None) -> dict:
         ),
         "fund_flow_recent": "逐日主力净流入:main_net_yi=亿元,main_ratio_pct=占成交额%",
         "price_source": "sina_realtime=实时接口;spot_fallback=实时不可用时的快照兜底",
+        "board_pct": "所属东财行业板块当日涨跌幅(%)",
+        "vs_board_pct": "个股涨跌幅减板块涨跌幅(百分点),正=强于板块",
+        "board_vs_market_pct": "板块涨跌幅减全市场均涨跌幅(百分点),正=板块强于大盘",
     }
+
+
+def get_industry_boards() -> pd.DataFrame:
+    """东财行业板块当日快照(akshare);按日缓存。列:name/code/pct/up/down。"""
+    key = f"boards_{_today()}"
+    if key in _MEM:
+        return _MEM[key]
+    ensure_dirs()
+    path = CACHE_DIR / f"{key}.pkl"
+    if _is_fresh(path):
+        df = pd.read_pickle(path)
+        _MEM[key] = df
+        return df
+    import akshare as ak
+
+    try:
+        raw = ak.stock_board_industry_name_em()
+    except Exception:
+        _MEM[key] = pd.DataFrame()
+        return _MEM[key]
+    rename = {"板块名称": "name", "板块代码": "code", "涨跌幅": "pct",
+              "上涨家数": "up", "下跌家数": "down"}
+    df = raw.rename(columns={k: v for k, v in rename.items() if k in raw.columns})
+    for c in ("pct", "up", "down"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    keep = [c for c in ("name", "code", "pct", "up", "down") if c in df.columns]
+    df = df[keep] if keep else pd.DataFrame()
+    if not df.empty:
+        df.to_pickle(path)
+    _MEM[key] = df
+    return df
+
+
+def _match_industry_board(industry: str, board_code: str | None,
+                          boards: pd.DataFrame) -> pd.Series | None:
+    if boards.empty:
+        return None
+    if board_code:
+        hit = boards[boards["code"].astype(str) == str(board_code)]
+        if not hit.empty:
+            return hit.iloc[0]
+    ind = (industry or "").strip()
+    if not ind:
+        return None
+    hit = boards[boards["name"].astype(str) == ind]
+    if not hit.empty:
+        return hit.iloc[0]
+    hit = boards[boards["name"].astype(str).str.contains(ind, na=False, regex=False)]
+    if not hit.empty:
+        return hit.iloc[0]
+    hit = boards[boards["name"].astype(str).apply(lambda n: ind in str(n) if n else False)]
+    return hit.iloc[0] if not hit.empty else None
+
+
+def _sector_decision_hint(ctx: dict, market_avg_pct: float | None) -> str:
+    bpct = ctx.get("board_pct")
+    spct = ctx.get("stock_pct")
+    bvm = ctx.get("board_vs_market_pct")
+    if bpct is None:
+        return "未匹配到行业板块数据;卖出/买入除大盘外请尽量 get_sector_context 核对板块"
+    parts = [f"板块{ctx.get('board_name')}当日{bpct:+.2f}%"]
+    if market_avg_pct is not None and bvm is not None:
+        parts.append(f"板块较全市场{'强' if bvm > 0 else '弱'}{abs(bvm):.2f}pct")
+    if spct is not None and ctx.get("vs_board_pct") is not None:
+        vs = ctx["vs_board_pct"]
+        parts.append(f"个股较板块{'强' if vs > 0 else '弱'}{abs(vs):.2f}pct")
+    if market_avg_pct is not None and market_avg_pct < -1 and bvm is not None and bvm > 0:
+        parts.append("大盘弱但板块强,不宜仅凭大盘弱就止盈/清仓")
+    elif market_avg_pct is not None and market_avg_pct < -1 and bvm is not None and bvm < -1:
+        parts.append("大盘与板块均弱,风控减仓更合理")
+    return "；".join(parts)
+
+
+def get_sector_context(symbol: str, market_avg_pct: float | None = None) -> dict:
+    """个股所属行业板块行情 + 相对大盘/板块强弱(东财行业板块 + 新浪实时价)。"""
+    base = get_base_info(symbol)
+    live = get_live_quotes([symbol]).get(symbol, {})
+    stock_pct = None
+    if live:
+        pc = float(live.get("prev_close") or 0)
+        if pc > 0 and live.get("price"):
+            stock_pct = round((float(live["price"]) / pc - 1) * 100, 2)
+    industry = (base.get("industry") or "").strip()
+    boards = get_industry_boards()
+    row = _match_industry_board(industry, base.get("board_code"), boards)
+    out: dict = {
+        "symbol": symbol,
+        "name": base.get("name") or live.get("name"),
+        "industry": industry or None,
+        "stock_pct": stock_pct,
+    }
+    if row is not None:
+        bpct = row.get("pct")
+        bpct_f = None if pd.isna(bpct) else float(bpct)
+        out.update({
+            "board_name": str(row.get("name", "")),
+            "board_code": str(row.get("code", "")),
+            "board_pct": round(bpct_f, 2) if bpct_f is not None else None,
+            "board_up": int(row["up"]) if pd.notna(row.get("up")) else None,
+            "board_down": int(row["down"]) if pd.notna(row.get("down")) else None,
+        })
+        if stock_pct is not None and bpct_f is not None:
+            out["vs_board_pct"] = round(stock_pct - bpct_f, 2)
+        if market_avg_pct is not None and bpct_f is not None:
+            out["board_vs_market_pct"] = round(bpct_f - market_avg_pct, 2)
+        if stock_pct is not None and market_avg_pct is not None:
+            out["stock_vs_market_pct"] = round(stock_pct - market_avg_pct, 2)
+    out["decision_hint"] = _sector_decision_hint(out, market_avg_pct)
+    return out
 
 
 def get_hist(symbol: str, lookback_days: int = 400, adjust: str = "qfq") -> pd.DataFrame:
@@ -296,8 +409,9 @@ def get_base_info(symbol: str) -> dict:
     path = CACHE_DIR / f"base_{symbol}.pkl"
     if _is_fresh(path):
         info = pd.read_pickle(path)
-        _MEM[key] = info
-        return info
+        if "board_code" in info:
+            _MEM[key] = info
+            return info
 
     try:
         import efinance as ef
@@ -308,7 +422,16 @@ def get_base_info(symbol: str) -> dict:
         _MEM[key] = {}
         return _MEM[key]
     d = s.to_dict() if hasattr(s, "to_dict") else dict(s)
-    info = {"industry": d.get("所处行业"), "name": d.get("股票名称")}
+    board_code = None
+    for v in d.values():
+        if v is not None and str(v).strip().upper().startswith("BK"):
+            board_code = str(v).strip().upper()
+            break
+    info = {
+        "industry": d.get("所处行业"),
+        "name": d.get("股票名称"),
+        "board_code": board_code,
+    }
     pd.to_pickle(info, path)
     _MEM[key] = info
     return info
